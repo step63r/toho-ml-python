@@ -9,8 +9,6 @@ from gym import spaces
 from PIL import Image, ImageGrab, ImageTk
 from typing import Any, Dict, Tuple
 
-from numpy.lib.type_check import imag
-
 
 from utils import cv2helper
 from utils.native import COMMAND_DICT, SCAN_Z, SCAN_RIGHT, GetWindowRect, PressKey, ReleaseKey
@@ -71,7 +69,7 @@ class Kanjuden(gym.Env):
         ReleaseKey(hex_key_code)
         time.sleep(2)
 
-    def __init__(self, grid_size=[384, 450, 1],
+    def __init__(self, grid_size=[450, 384],
                  app_class_name: str = "BASE",
                  app_window_name: str = "東方紺珠伝　～ Legacy of Lunatic Kingdom. ver 1.00b",
                  use_rgb: bool = False,
@@ -86,7 +84,7 @@ class Kanjuden(gym.Env):
         Parameters
         ----------
         grid_size : list, optional
-            グリッドサイズ, by default [384, 450, 1]
+            グリッドサイズ, by default [450, 384]
         app_class_name : str, optional
             キャプチャ対象のウィンドウクラス名, by default BASE
         app_window_name : str, optional
@@ -115,22 +113,34 @@ class Kanjuden(gym.Env):
         self.clip_bottom = clip_bottom
         self.clip_left = clip_left
         self.clip_right = clip_right
-        self.action_space = spaces.Discrete(len(COMMAND_DICT))
+        self.action_space = spaces.Discrete(len(COMMAND_DICT) - 1)
         self.observation_space = spaces.Box(
             low=0, high=255, shape=self.grid_size.shape, dtype=np.float
         )
 
         # ウィンドウ座標取得 (これ以降ウィンドウの場所を変えないこと)
         self.left, self.top, self.right, self.bottom = GetWindowRect(app_class_name, app_window_name)
+
+        print(f"==================================================")
+        print(f"Properties")
+        print(f"  grid_size      : {self.grid_size.shape}")
+        print(f"  app_class_name : {self.app_class_name}")
+        print(f"  app_window_name: {self.app_window_name}")
+        print(f"  use_rgb        : {self.use_rgb}")
+        print(f"  shrink_ratio   : {self.shrink_ratio}")
+        print(f"  clip           : {self.clip_left}, {self.clip_top}, {self.clip_right}, {self.clip_bottom}")
+        print(f"  rect           : {self.left}, {self.top}, {self.right}, {self.bottom}")
+        print(f"==================================================")
+
         time.sleep(10)
 
-        print("Title -> Mode Select")
+        print("Title -> Mode Select (Pointdevice Mode)")
         self.__press_and_release_key(SCAN_Z)
 
-        print("Mode Select -> Rank Select")
+        print("Mode Select -> Rank Select (NORMAL Mode)")
         self.__press_and_release_key(SCAN_Z)
 
-        print("Rank Select -> Player Select")
+        print("Rank Select -> Player Select (REIMU HAKUREI)")
         self.__press_and_release_key(SCAN_Z)
 
         print("Player Select -> Game Start")
@@ -149,7 +159,7 @@ class Kanjuden(gym.Env):
         numpy.ndarray
             初期化後のグリッドのテンソル
         """
-        self.grid_size: np.ndarray = np.zeros([0, 0, 0])
+        self.grid_size: np.ndarray = np.zeros([450, 384])
         return self.grid_size
 
     def step(self, action: Any) -> Tuple[Any, float, bool, Dict[str, Any]]:
@@ -166,22 +176,27 @@ class Kanjuden(gym.Env):
         Tuple[Any, float, bool, Dict[str, Any]]
             [description]
         """
+        time.sleep(4 * (1.0 / 60))
         self.__command_start(action)
-        self.__command_end(action)  # TODO: 場所検討
+        time.sleep(4 * (1.0 / 60))
+        self.__command_end(action)
+        time.sleep(4 * (1.0 / 60))
 
-        img: Image = ImageGrab.grab((self.left, self.top, self.right, self.bottom))
+        img: Image = ImageGrab.grab((self.left, self.top, self.right, self.bottom), include_layered_windows=False, all_screens=True)
         imgArray: np.ndarray = np.asarray(img, dtype='uint8')
         if not self.use_rgb:
             imgArray = cv2.cvtColor(imgArray, cv2.COLOR_BGR2GRAY)
         imgArray = cv2.resize(imgArray, (int(imgArray.shape[1] * self.shrink_ratio), int(imgArray.shape[0] * self.shrink_ratio)))
         imgArray = imgArray[self.clip_top:self.clip_bottom, self.clip_left:self.clip_right]
 
-        observation: np.ndarray = np.zeros(self.grid_size.shape())
+        observation: np.ndarray = np.zeros(self.grid_size.shape)
         reward = 0
         done = False
         observation = imgArray.copy()
         self.current_screen = imgArray.copy()
 
+        cv2helper.imwrite('current_screen.png', imgArray)
+        
         # テンプレートマッチングによる報酬計算
         # Chapter Finish
         cf_templates = [
@@ -192,7 +207,7 @@ class Kanjuden(gym.Env):
             "template_chapter_finish_5.png"
         ]
         for cf_template in cf_templates:
-            img_template = cv2helper.imread(f"./templates/{cf_template}", 0)
+            img_template = cv2helper.imread(f"./environment/templates/{cf_template}", 0)
             result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
             # min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
             if len(np.where(result >= 0.95)[0]) > 0:
@@ -204,9 +219,9 @@ class Kanjuden(gym.Env):
         
         # Spell Card Bonus
         if reward == 0:
-            img_template = cv2helper.imread("./templates/template_get_spell_card_bonus.png", 0)
+            img_template = cv2helper.imread("./environment/templates/template_get_spell_card_bonus.png", 0)
             result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
-            if (len(np.where(result >= 0.95))[0]) > 0:
+            if len(np.where(result >= 0.95)[0]) > 0:
                 print("Spell Card Bonus detected")
                 reward = 500
         
@@ -218,12 +233,16 @@ class Kanjuden(gym.Env):
 
         # Mission Incomplete
         if reward == 0:
-            img_template = cv2helper.imread("./templates/template_mission_incomplete.png", 0)
-            result = cv2.matchTemplate(action, img_template, cv2.TM_CCOEFF_NORMED)
-            if (len(np.where(result >= 0.95))[0]) > 0:
+            img_template = cv2helper.imread("./environment/templates/template_mission_incomplete.png", 0)
+            result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
+            if len(np.where(result >= 0.95)[0]) > 0:
                 print("Mission Incomplete detected")
                 reward = -100
                 done = True
+                # 今のをなかったことにする
+                self.__press_and_release_key(SCAN_Z)
+                # 300フレームのクールダウン
+                time.sleep(300 * (1.0 / 60))
 
         return observation, reward, done, {}
 
