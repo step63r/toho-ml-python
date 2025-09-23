@@ -11,7 +11,7 @@ from typing import Any, Dict, Tuple
 
 
 from utils import cv2helper
-from utils.native import COMMAND_DICT, SCAN_Z, SCAN_RIGHT, GetWindowRect, PressKey, ReleaseKey
+from utils.native import COMMAND_DICT, SCAN_ESC, SCAN_Z, SCAN_RIGHT, SCAN_LEFT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT, GetWindowRect, PressKey, ReleaseKey
 
 
 class Kanjuden(gym.Env):
@@ -67,7 +67,12 @@ class Kanjuden(gym.Env):
         PressKey(hex_key_code)
         time.sleep(4 * (1.0 / 60))
         ReleaseKey(hex_key_code)
-        time.sleep(2)
+        time.sleep(1)
+
+    def _release_all_keys(self) -> None:
+        """環境で使用し得る全てのキーを強制的に離す"""
+        for key in {SCAN_Z, SCAN_LEFT, SCAN_RIGHT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT}:
+            ReleaseKey(key)
 
     def __init__(self, grid_size=[450, 384],
                  app_class_name: str = "BASE",
@@ -117,6 +122,20 @@ class Kanjuden(gym.Env):
         self.observation_space = spaces.Box(
             low=0, high=255, shape=self.grid_size.shape, dtype=np.float
         )
+        self.previous_point_p_count = 0
+        self.previous_point_ten_count = 0
+        # --- Mission Incomplete (Game Over) 検出用状態 ---
+        # フェードインの早期段階での弱マッチを捕捉して入力を抑止する
+        self._mission_incomplete_template = cv2helper.imread(
+            "./environment/templates/template_mission_incomplete.png", 0
+        )
+        self._mi_soft_threshold = 0.80        # フェードイン初期用ソフト閾値
+        self._mi_hard_threshold = 0.95        # 従来確定判定用ハード閾値
+        self._mi_soft_required_frames = 5     # xz連続何フレームソフト閾値超で確定扱い
+        self._mi_soft_counter = 0
+        self._in_game_over_pending = False    # ソフト検出中 (入力抑止)
+        self._in_game_over_cooldown = 0       # クールダウン残フレーム
+        self.current_screen = None            # render安全用初期化
 
         # ウィンドウ座標取得 (これ以降ウィンドウの場所を変えないこと)
         self.left, self.top, self.right, self.bottom = GetWindowRect(app_class_name, app_window_name)
@@ -132,23 +151,8 @@ class Kanjuden(gym.Env):
         print(f"  rect           : {self.left}, {self.top}, {self.right}, {self.bottom}")
         print(f"==================================================")
 
-        time.sleep(10)
-
-        print("Title -> Mode Select (Pointdevice Mode)")
-        self.__press_and_release_key(SCAN_Z)
-
-        print("Mode Select -> Rank Select (NORMAL Mode)")
-        self.__press_and_release_key(SCAN_Z)
-
-        print("Rank Select -> Player Select (REIMU HAKUREI)")
-        self.__press_and_release_key(SCAN_Z)
-
-        print("Player Select -> Game Start")
-        self.__press_and_release_key(SCAN_Z)
-
-        print("中断データから再開 (いいえ)")
-        self.__press_and_release_key(SCAN_RIGHT)
-        self.__press_and_release_key(SCAN_Z)
+        # 初回起動: ゲーム開始まで自動遷移
+        self.fast_restart(initial=True)
     
     def reset(self) -> np.ndarray:
         """
@@ -160,7 +164,39 @@ class Kanjuden(gym.Env):
             初期化後のグリッドのテンソル
         """
         self.grid_size: np.ndarray = np.zeros([450, 384])
-        return self.grid_size
+        # GameOver関連状態をリセット
+        self._mi_soft_counter = 0
+        self._in_game_over_pending = False
+        self._in_game_over_cooldown = 0
+        return self._capture_observation()
+
+    # 観測キャプチャを共通化
+    def _capture_observation(self) -> np.ndarray:
+        img: Image = ImageGrab.grab((self.left, self.top, self.right, self.bottom), include_layered_windows=False, all_screens=True)
+        imgArray: np.ndarray = np.asarray(img, dtype='uint8')
+        if not self.use_rgb:
+            imgArray = cv2.cvtColor(imgArray, cv2.COLOR_BGR2GRAY)
+        imgArray = cv2.resize(imgArray, (int(imgArray.shape[1] * self.shrink_ratio), int(imgArray.shape[0] * self.shrink_ratio)))
+        imgArray = imgArray[self.clip_top:self.clip_bottom, self.clip_left:self.clip_right]
+        self.current_screen = imgArray.copy()
+        cv2helper.imwrite('current_screen.png', imgArray)
+        return imgArray
+
+    def fast_restart(self, initial: bool = False) -> np.ndarray:
+        """初回: メニューをゲーム開始まで進める / それ以降: ESCでリトライ画面確定 (想定)"""
+        self._release_all_keys()
+        if initial:
+            sequence = [SCAN_Z, SCAN_Z, SCAN_Z, SCAN_Z, SCAN_RIGHT, SCAN_Z]
+        else:
+            sequence = [SCAN_ESC]
+        for code in sequence:
+            self.__press_and_release_key(code)
+            time.sleep(2 * (1.0/60))
+        # 状態初期化
+        self._mi_soft_counter = 0
+        self._in_game_over_pending = False
+        self._in_game_over_cooldown = 0
+        return self._capture_observation()
 
     def step(self, action: Any) -> Tuple[Any, float, bool, Dict[str, Any]]:
         """
@@ -176,18 +212,15 @@ class Kanjuden(gym.Env):
         Tuple[Any, float, bool, Dict[str, Any]]
             [description]
         """
-        time.sleep(4 * (1.0 / 60))
-        self.__command_start(action)
-        time.sleep(4 * (1.0 / 60))
-        self.__command_end(action)
-        time.sleep(4 * (1.0 / 60))
+        info: Dict[str, Any] = {}
+        suppress_input = self._in_game_over_pending  # クールダウンは学習側へ移譲
+        if suppress_input:
+            self._release_all_keys()
+        else:
+            self.__command_start(action)
+            self.__command_end(action)
 
-        img: Image = ImageGrab.grab((self.left, self.top, self.right, self.bottom), include_layered_windows=False, all_screens=True)
-        imgArray: np.ndarray = np.asarray(img, dtype='uint8')
-        if not self.use_rgb:
-            imgArray = cv2.cvtColor(imgArray, cv2.COLOR_BGR2GRAY)
-        imgArray = cv2.resize(imgArray, (int(imgArray.shape[1] * self.shrink_ratio), int(imgArray.shape[0] * self.shrink_ratio)))
-        imgArray = imgArray[self.clip_top:self.clip_bottom, self.clip_left:self.clip_right]
+        imgArray = self._capture_observation()
 
         observation: np.ndarray = np.zeros(self.grid_size.shape)
         reward = 0
@@ -195,8 +228,6 @@ class Kanjuden(gym.Env):
         observation = imgArray.copy()
         self.current_screen = imgArray.copy()
 
-        cv2helper.imwrite('current_screen.png', imgArray)
-        
         # テンプレートマッチングによる報酬計算
         # Chapter Finish
         cf_templates = [
@@ -226,25 +257,80 @@ class Kanjuden(gym.Env):
                 reward = 500
         
         # 霊力
-        # TODO: 前フレームより増えた数だけ +1
+        # 現在の画面と templates/point_p.png のテンプレートマッチングを行い、
+        # 前回の画面と比較して増えていたらマッチした数だけ+1の報酬を与える
+        if reward == 0:
+            img_template = cv2helper.imread("./environment/templates/template_point_p.png", 0)
+            result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
+            current_p_count = len(np.where(result >= 0.95)[0])
+            if current_p_count > 0 and current_p_count > self.previous_point_p_count:
+                print("Point +1 detected")
+                reward = 1 * (current_p_count - self.previous_point_p_count)
 
         # 得点
-        # TODO: 前フレームより増えた数だけ +1
-
-        # Mission Incomplete
+        # 現在の画面と templates/point_ten.png のテンプレートマッチングを行い、
+        # 前回の画面と比較して増えていたらマッチした数だけ+1の報酬を与える
         if reward == 0:
-            img_template = cv2helper.imread("./environment/templates/template_mission_incomplete.png", 0)
+            img_template = cv2helper.imread("./environment/templates/template_point_ten.png", 0)
             result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
-            if len(np.where(result >= 0.95)[0]) > 0:
-                print("Mission Incomplete detected")
+            current_ten_count = len(np.where(result >= 0.95)[0])
+            if current_ten_count > 0 and current_ten_count > self.previous_point_ten_count:
+                print("Ten +1 detected")
+                reward = 1 * (current_ten_count - self.previous_point_ten_count)
+
+        # Mission Incomplete (Game Over) 検出 (フェードイン対応)
+        if reward == 0:
+            # 事前読込済テンプレートを使用
+            result = cv2.matchTemplate(imgArray, self._mission_incomplete_template, cv2.TM_CCOEFF_NORMED)
+            _min_val, max_val, _min_loc, _max_loc = cv2.minMaxLoc(result)
+
+            if max_val >= self._mi_hard_threshold:
+                # ハード閾値到達で確定
+                print(f"Mission Incomplete HARD detected (val={max_val:.3f})")
                 reward = -100
                 done = True
-                # 今のをなかったことにする
-                self.__press_and_release_key(SCAN_Z)
-                # 300フレームのクールダウン
-                time.sleep(300 * (1.0 / 60))
+                self._mi_soft_counter = 0
+                self._in_game_over_pending = False
+                info["game_over_state"] = "hard"
+                info["game_over_confidence"] = max_val
+                info["restart_ready"] = True
+                info["input_allowed"] = False
+            else:
+                if max_val >= self._mi_soft_threshold:
+                    # ソフト検出域
+                    self._mi_soft_counter += 1
+                    if not self._in_game_over_pending:
+                        print(f"Mission Incomplete SOFT start (val={max_val:.3f}) -> suppress inputs")
+                    self._in_game_over_pending = True
+                    if self._mi_soft_counter >= self._mi_soft_required_frames:
+                        # 規定フレーム継続で確定昇格
+                        print(f"Mission Incomplete promoted from SOFT to HARD (counter={self._mi_soft_counter}, val={max_val:.3f})")
+                        reward = -100
+                        done = True
+                        self._mi_soft_counter = 0
+                        self._in_game_over_pending = False
+                        info["game_over_state"] = "hard"
+                        info["game_over_confidence"] = max_val
+                        info["restart_ready"] = True
+                        info["input_allowed"] = False
+                else:
+                    # 閾値未満: ソフト状態解除
+                    if self._in_game_over_pending:
+                        print(f"Mission Incomplete soft canceled (val={max_val:.3f})")
+                    self._mi_soft_counter = 0
+                    self._in_game_over_pending = False
 
-        return observation, reward, done, {}
+        if "game_over_state" not in info:
+            if self._in_game_over_pending:
+                info["game_over_state"] = "soft"
+                info["restart_ready"] = False
+                info["input_allowed"] = False
+            else:
+                info["game_over_state"] = "none"
+                info["restart_ready"] = False
+                info["input_allowed"] = True
+
+        return observation, reward, done, info
 
     def render(self, mode='console') -> None:
         """
