@@ -1,4 +1,5 @@
 import argparse
+import logging
 
 from stable_baselines3.ppo.ppo import PPO
 from typing import Any
@@ -50,10 +51,11 @@ if __name__ == '__main__':
         default="東方紺珠伝　～ Legacy of Lunatic Kingdom. ver 1.00b",
         help="キャプチャ対象のウィンドウ名")
     parser.add_argument("--use_rgb", action="store_true", help="RGB画像を使う")
-    parser.add_argument("--shrink_ratio", type=float, default=0.5, help="画像縮小率")
-    parser.add_argument("--clip_top", type=int, default=26, help="画像を切り取る位置 (top)")
-    parser.add_argument("--clip_bottom", type=int, default=476, help="画像を切り取る位置 (bottom)")
+    parser.add_argument("--shrink_ratio", type=float, default=1.0, help="観測画像の縮小率")
+    parser.add_argument("--clip_top", type=int, default=16, help="画像を切り取る位置 (top, 640x480 での座標)")
+    parser.add_argument("--clip_bottom", type=int, default=466, help="画像を切り取る位置 (bottom)")
     parser.add_argument("--clip_left", type=int, default=32, help="画像を切り取る位置 (left)")
     parser.add_argument("--clip_right", type=int, default=416, help="画像を切り取る位置 (right)")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     main(args)

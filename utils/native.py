@@ -1,4 +1,8 @@
 import ctypes
+import time
+
+
+from typing import Sequence
 
 
 PUL = ctypes.POINTER(ctypes.c_ulong)
@@ -168,6 +172,27 @@ def ReleaseKey(hex_key_code: int) -> None:
     ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
 
 
+def HoldKeys(scan_codes: Sequence[int], frames: int) -> None:
+    """
+    キーを指定フレーム数だけ押し続けてから離す
+
+    押して即離すとゲームのキー入力ポーリング (60fps) に拾われないことがあるため、
+    最低でも数フレームは押し続ける。
+
+    Parameters
+    ----------
+    scan_codes : Sequence[int]
+        スキャンコード
+    frames : int
+        押し続けるフレーム数 (60fps換算)
+    """
+    for code in scan_codes:
+        PressKey(code)
+    time.sleep(frames / 60)
+    for code in scan_codes:
+        ReleaseKey(code)
+
+
 class Rect(ctypes.Structure):
     """
     RECT構造体 (windef.h)
@@ -218,6 +243,47 @@ class WindowInfo(ctypes.Structure):
                 ('wCreatorVersion', ctypes.c_ushort)]
 
 
+def FocusWindow(class_name: str, window_name: str) -> bool:
+    """
+    指定したウィンドウを前面に出す
+
+    SendInput は前面ウィンドウにしか届かないため、キー入力の前に呼ぶ。
+
+    Parameters
+    ----------
+    class_name : str
+        クラス名
+    window_name : str
+        ウィンドウキャプション
+
+    Returns
+    -------
+    bool
+        成功したらTrue。Windowsの前面化制限で失敗することがある
+    """
+    hWnd = ctypes.windll.user32.FindWindowW(ctypes.c_wchar_p(class_name), ctypes.c_wchar_p(window_name))
+    if not hWnd:
+        return False
+    return bool(ctypes.windll.user32.SetForegroundWindow(hWnd))
+
+
+def IsKeyDown(virtual_key_code: int) -> bool:
+    """
+    仮想キーが押されているかを取得する (他のウィンドウにフォーカスがあっても有効)
+
+    Parameters
+    ----------
+    virtual_key_code : int
+        仮想キーコード (例: F8 = 0x77)
+
+    Returns
+    -------
+    bool
+        押されていたらTrue
+    """
+    return bool(ctypes.windll.user32.GetAsyncKeyState(virtual_key_code) & 0x8000)
+
+
 def GetWindowRect(class_name: str, window_name: str) -> tuple[int, int, int, int]:
     """
     指定したクラス名のウィンドウ座標を取得する
@@ -241,11 +307,47 @@ def GetWindowRect(class_name: str, window_name: str) -> tuple[int, int, int, int
     WindowsError
         GetWindowInfo() 失敗
     """
+    window_info = _GetWindowInfo(class_name, window_name)
+    return window_info.rcWindow.left, window_info.rcWindow.top, window_info.rcWindow.right, window_info.rcWindow.bottom
+
+
+def GetClientRect(class_name: str, window_name: str) -> tuple[int, int, int, int]:
+    """
+    指定したクラス名のウィンドウのクライアント領域 (タイトルバーと枠を除く) の画面座標を取得する
+
+    ウィンドウの表示倍率 (640x480 / 960x720 / 1280x960) を変えても、
+    ゲーム画面そのものだけを取り出すために、ウィンドウ全体ではなくこちらを使う。
+
+    Parameters
+    ----------
+    class_name : str
+        クラス名
+    window_name : str
+        ウィンドウキャプション
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        クライアント領域の画面座標 (左, 上, 右, 下)
+
+    Raises
+    ------
+    WindowsError
+        FindWindow() 失敗
+    WindowsError
+        GetWindowInfo() 失敗
+    """
+    window_info = _GetWindowInfo(class_name, window_name)
+    return window_info.rcClient.left, window_info.rcClient.top, window_info.rcClient.right, window_info.rcClient.bottom
+
+
+def _GetWindowInfo(class_name: str, window_name: str) -> WindowInfo:
     hWnd: ctypes.c_void_p = ctypes.windll.user32.FindWindowW(ctypes.c_wchar_p(class_name), ctypes.c_wchar_p(window_name))
     if not hWnd:
         raise WindowsError("FindWindow() 失敗")
     window_info = WindowInfo()
+    window_info.cbSize = ctypes.sizeof(WindowInfo)
     bRet: ctypes.c_bool = ctypes.windll.user32.GetWindowInfo(hWnd, ctypes.byref(window_info))
     if not bRet:
         raise WindowsError("GetWindowInfo() 失敗")
-    return window_info.rcWindow.left, window_info.rcWindow.top, window_info.rcWindow.right, window_info.rcWindow.bottom
+    return window_info

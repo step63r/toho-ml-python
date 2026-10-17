@@ -1,0 +1,327 @@
+from typing import Callable, Dict, List, Optional, Sequence
+
+import numpy as np
+import pytest
+
+from environment.flow import FlowConfig, FlowError, GameFlow, default_flow_config
+from environment.screens import Detection, Screen
+from utils.native import SCAN_ESC, SCAN_Z
+
+Z = (0x2C,)
+
+
+class FakeGame:
+    """
+    画面・キー入力・時計の偽物
+
+    sleep で時計が進む。キー入力のたびに transitions に従って画面が切り替わる。
+    """
+    def __init__(self, screen: Screen, transitions: Optional[Dict[Screen, Screen]] = None) -> None:
+        self.screen = screen
+        self.transitions = transitions or {}
+        self.presses: List[Screen] = []
+        self.codes: List[Sequence[int]] = []
+        self.now = 0.0
+        self.frames: List[Screen] = []
+        # プレイ画面は動く (背景が流れる)。止めると、操作説明の詳細画面のように HUD が残ったまま静止する画面を再現できる
+        self.moving = True
+        self.grabs = 0
+
+    def grab(self) -> np.ndarray:
+        self.grabs += 1
+        frame = np.zeros((480, 640), dtype=np.uint8)
+        if self.moving:
+            frame[100:300, 100:300] = 120 * (self.grabs % 2)
+        return frame
+
+    def detect(self, frame: np.ndarray) -> Detection:
+        self.frames.append(self.screen)
+        return Detection(self.screen, 0.0)
+
+    def press(self, codes: Sequence[int]) -> None:
+        self.presses.append(self.screen)
+        self.codes.append(tuple(codes))
+        self.screen = self.transitions.get(self.screen, self.screen)
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def clock(self) -> float:
+        return self.now
+
+
+def make_flow(game: FakeGame, keys: Dict[Screen, Sequence[int]], **overrides) -> GameFlow:
+    class Detector:
+        detect = staticmethod(game.detect)
+
+    return GameFlow(game.grab, game.press, Detector(), FlowConfig(keys=keys, **overrides),
+                    sleep=game.sleep, clock=game.clock)
+
+
+def test_すでにプレイ画面なら何も押さない():
+    game = FakeGame(Screen.PLAYING)
+
+    make_flow(game, {Screen.GAME_OVER: Z}).advance_to_playing()
+
+    assert game.presses == []
+
+
+def test_ゲームオーバーから決定キーを1回押してプレイ画面まで進む():
+    game = FakeGame(Screen.GAME_OVER, {Screen.GAME_OVER: Screen.LOADING})
+    # ローディングは一定時間で自動的にプレイ画面になる
+    original_sleep = game.sleep
+
+    def sleep(seconds: float) -> None:
+        original_sleep(seconds)
+        if game.screen is Screen.LOADING and game.now > 5:
+            game.screen = Screen.PLAYING
+
+    game.sleep = sleep
+
+    make_flow(game, {Screen.GAME_OVER: Z}).advance_to_playing()
+
+    assert game.presses == [Screen.GAME_OVER]
+
+
+def test_タイトルからプレイ画面まで画面ごとのキーで順に進む():
+    game = FakeGame(Screen.TITLE_GAME_START, {
+        Screen.TITLE_GAME_START: Screen.MODE_SELECT,
+        Screen.MODE_SELECT: Screen.RANK_SELECT,
+        Screen.RANK_SELECT: Screen.PLAYER_SELECT,
+        Screen.PLAYER_SELECT: Screen.RESUME_DIALOG,
+        Screen.RESUME_DIALOG: Screen.PLAYING,
+    })
+
+    make_flow(game, dict(default_flow_config().keys)).advance_to_playing()
+
+    assert game.presses == [Screen.TITLE_GAME_START, Screen.MODE_SELECT, Screen.RANK_SELECT,
+                            Screen.PLAYER_SELECT, Screen.RESUME_DIALOG]
+
+
+def test_画面が出てから待ち時間を置いて入力する():
+    game = FakeGame(Screen.GAME_OVER, {Screen.GAME_OVER: Screen.PLAYING})
+    pressed_at: List[float] = []
+    original_press = game.press
+    game.press = lambda codes: (pressed_at.append(game.now), original_press(codes))[1]
+
+    make_flow(game, {Screen.GAME_OVER: Z}, settle_sec=1.5).advance_to_playing()
+
+    assert pressed_at[0] >= 1.5
+
+
+def test_進まなければ再入力し_上限を超えたらFlowError():
+    game = FakeGame(Screen.GAME_OVER)
+
+    with pytest.raises(FlowError, match="進みませんでした"):
+        make_flow(game, {Screen.GAME_OVER: Z}, max_presses_per_screen=2).advance_to_playing()
+
+    assert len(game.presses) == 2
+
+
+def test_再入力で進めば止まる():
+    game = FakeGame(Screen.GAME_OVER)
+    original_press = game.press
+
+    def press(codes: Sequence[int]) -> None:
+        original_press(codes)
+        if len(game.presses) == 2:
+            game.screen = Screen.PLAYING
+
+    game.press = press
+
+    make_flow(game, {Screen.GAME_OVER: Z}, max_presses_per_screen=3).advance_to_playing()
+
+    assert len(game.presses) == 2
+
+
+def test_キーの無い画面で動けなければ押さずにFlowError():
+    # キャラ選択画面でモード・難易度が想定と違う場合など、手動操作が必要な画面
+    game = FakeGame(Screen.PLAYER_SELECT_MISMATCH)
+
+    with pytest.raises(FlowError, match="手動"):
+        make_flow(game, dict(default_flow_config().keys), stuck_timeout_sec=5).advance_to_playing()
+
+    assert game.presses == []
+
+
+def test_判定できない画面が続いたらFlowError():
+    game = FakeGame(Screen.UNKNOWN)
+
+    with pytest.raises(FlowError):
+        make_flow(game, dict(default_flow_config().keys), stuck_timeout_sec=5).advance_to_playing()
+
+    assert game.presses == []
+
+
+def test_時間切れはFlowError():
+    game = FakeGame(Screen.LOADING)
+
+    with pytest.raises(FlowError, match="プレイ画面になりませんでした"):
+        make_flow(game, {}, stuck_timeout_sec=1000).advance_to_playing(timeout_sec=10)
+
+
+def test_1フレームだけのプレイ画面判定では完了としない():
+    game = FakeGame(Screen.GAME_OVER)
+    calls = {"n": 0}
+
+    def detect(frame: np.ndarray) -> Detection:
+        calls["n"] += 1
+        # 3回に1回だけ PLAYING と誤検出する
+        return Detection(Screen.PLAYING if calls["n"] % 3 == 0 else Screen.GAME_OVER, 0.0)
+
+    flow = GameFlow(game.grab, game.press, type("D", (), {"detect": staticmethod(detect)})(),
+                    FlowConfig(keys={Screen.GAME_OVER: Z}, max_presses_per_screen=1),
+                    sleep=game.sleep, clock=game.clock)
+
+    with pytest.raises(FlowError):
+        flow.advance_to_playing()
+
+
+def test_既定の設定では_ゲームオーバーで決定キーではなくEscを押す():
+    keys = default_flow_config().keys
+
+    assert keys[Screen.GAME_OVER] == (SCAN_ESC,)
+    assert SCAN_Z not in keys[Screen.GAME_OVER]
+    # 操作説明に入ってしまった場合と、画面が止まったままの場合も、Esc で戻る
+    escape_screens = {Screen.GAME_OVER, Screen.MANUAL_MENU, Screen.STUCK}
+    assert all(keys[s] == (SCAN_ESC,) for s in escape_screens)
+    # 他の画面は決定キー
+    assert all(keys[s] == (SCAN_Z,) for s in keys if s not in escape_screens)
+
+
+class BlinkingGame(FakeGame):
+    """「Game Start」が点滅するタイトル: 検出できるのは周期の1回だけ (実機のログと同じ約0.67秒周期・1/4)"""
+    def __init__(self, period_polls: int, start_polls: set) -> None:
+        super().__init__(Screen.TITLE, {Screen.TITLE_GAME_START: Screen.PLAYING})
+        self.period_polls = period_polls
+        self.start_polls = start_polls
+        self.polls = 0
+        self.cursor_on_start = True
+
+    def detect(self, frame):
+        self.polls += 1
+        bright = self.cursor_on_start and (self.polls % self.period_polls) in self.start_polls
+        self.screen = Screen.TITLE_GAME_START if bright else Screen.TITLE
+        if self.presses:
+            self.screen = Screen.PLAYING
+        return Detection(self.screen, 0.0)
+
+
+def test_点滅する_Game_Start_は強調が一瞬でも選択中とみなして進む():
+    # 実機のログ: 周期は約0.67秒、検出は1フレーム (0.17 秒) だけ。ここでは 4 回に 1 回だけ検出される
+    game = BlinkingGame(period_polls=4, start_polls={1})
+    game.press = lambda codes: game.presses.append(Screen.TITLE_GAME_START)
+
+    make_flow(game, dict(default_flow_config().keys), poll_interval_sec=0.17).advance_to_playing()
+
+    assert game.presses == [Screen.TITLE_GAME_START]
+
+
+def test_強調が一度も検出されなければ_Quit_などを決定しないよう押さずに止まる():
+    game = BlinkingGame(period_polls=4, start_polls={1})
+    game.cursor_on_start = False                 # カーソルは他の項目にある (点滅しない)
+
+    with pytest.raises(FlowError, match="手動"):
+        make_flow(game, dict(default_flow_config().keys), poll_interval_sec=0.17, stuck_timeout_sec=5).advance_to_playing()
+
+    assert game.presses == []
+
+
+def test_保持は指定した秒数だけ(monkeypatch):
+    # 強調を一度検出したあと、保持時間を過ぎたら、タイトル (選択位置不明) に戻る
+    game = FakeGame(Screen.TITLE_GAME_START)
+    flow_calls = {"n": 0}
+
+    def detect(frame):
+        flow_calls["n"] += 1
+        return Detection(Screen.TITLE_GAME_START if flow_calls["n"] == 1 else Screen.TITLE, 0.0)
+
+    flow = GameFlow(game.grab, game.press, type("D", (), {"detect": staticmethod(detect)})(),
+                    FlowConfig(keys=dict(default_flow_config().keys), poll_interval_sec=0.5, settle_sec=100.0,
+                               stuck_timeout_sec=3.0, held={Screen.TITLE_GAME_START: (Screen.TITLE, 1.0)}),
+                    sleep=game.sleep, clock=game.clock)
+
+    with pytest.raises(FlowError, match="title"):
+        flow.advance_to_playing(timeout_sec=60)
+
+
+def test_実画像の点滅パターンでも_本物の判定器のまま決定キーを押せる():
+    # 明るい瞬間 (1フレーム) と暗い瞬間 (3フレーム) を、実機のログと同じ周期で並べる
+    from environment.screens import ScreenDetector
+    from tests.test_screens import load_screen
+
+    bright, dim = load_screen("title_game_start"), load_screen("title")
+    game = FakeGame(Screen.TITLE)
+    sequence = [dim, bright, dim, dim] * 10
+    frames = iter(sequence)
+    detector = ScreenDetector()
+    assert [detector.detect(f).screen for f in (bright, dim)] == [Screen.TITLE_GAME_START, Screen.TITLE]
+
+    def press(codes):
+        game.presses.append(Screen.TITLE_GAME_START)
+        raise StopIteration                              # 決定キーを押した時点で、検証を終える
+
+    flow = GameFlow(lambda: next(frames), press, detector,
+                    FlowConfig(keys=dict(default_flow_config().keys), poll_interval_sec=0.17),
+                    sleep=game.sleep, clock=game.clock)
+
+    with pytest.raises(StopIteration):
+        flow.advance_to_playing()
+
+    assert game.presses == [Screen.TITLE_GAME_START]
+    assert game.now < 3.0                                # 数秒以内に押せる
+
+
+class ManualGame(FakeGame):
+    """操作説明の詳細画面 (HUD が残るので PLAYING と判定され、静止している) から、Esc で順に戻っていく"""
+    def __init__(self, screen: Screen = Screen.PLAYING) -> None:
+        super().__init__(screen)
+        self.moving = False
+
+    def press(self, codes: Sequence[int]) -> None:
+        self.presses.append(self.screen)
+        self.codes.append(tuple(codes))
+        if self.screen in (Screen.PLAYING, Screen.UNKNOWN):
+            self.screen = Screen.MANUAL_MENU          # 詳細画面 → サブメニュー
+        elif self.screen is Screen.MANUAL_MENU:
+            self.screen = Screen.GAME_OVER            # サブメニュー → 攻略失敗メニュー
+        elif self.screen is Screen.GAME_OVER:
+            self.screen = Screen.PLAYING              # Esc で「今回を無かった事にする」が選ばれ、リトライされる
+            self.moving = True
+
+
+@pytest.mark.parametrize("static_screen", [Screen.PLAYING, Screen.UNKNOWN])
+def test_静止したままの画面は迷子とみなして_Escで攻略失敗メニューまで戻り_リトライする(static_screen):
+    game = ManualGame(static_screen)
+
+    make_flow(game, dict(default_flow_config().keys), still_sec=1.0).advance_to_playing()
+
+    # 詳細画面 (静止) → サブメニュー → 攻略失敗メニュー → リトライ。入力は全て Esc
+    assert game.presses == [static_screen, Screen.MANUAL_MENU, Screen.GAME_OVER]
+    assert all(codes == (SCAN_ESC,) for codes in game.codes)
+
+
+def test_動かないプレイ画面は_プレイ画面になったとはみなさない():
+    # 判定が PLAYING でも、画面が動いていなければ、完了にしない (操作説明の詳細画面を、プレイ中と取り違えないため)
+    game = ManualGame()
+
+    with pytest.raises(FlowError, match="手動"):
+        make_flow(game, {}, still_sec=1.0, stuck_timeout_sec=5).advance_to_playing()
+
+    assert game.presses == []
+
+
+def test_サブメニューは静止を待たずに検出して_Escで戻る():
+    game = ManualGame(Screen.MANUAL_MENU)
+
+    make_flow(game, dict(default_flow_config().keys), still_sec=100.0).advance_to_playing()
+
+    assert game.presses == [Screen.MANUAL_MENU, Screen.GAME_OVER]
+
+
+def test_動くプレイ画面は_静止判定の対象にならない():
+    game = FakeGame(Screen.PLAYING)
+
+    make_flow(game, dict(default_flow_config().keys), still_sec=0.2).advance_to_playing()
+
+    assert game.presses == []

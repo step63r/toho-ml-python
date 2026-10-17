@@ -1,361 +1,310 @@
-import cv2
-import gym
-import time
-import tkinter
+import gymnasium as gym
+import logging
 import numpy as np
+import tkinter
+
+from gymnasium import spaces
+from PIL import Image, ImageTk
+from typing import Any, Dict, Optional, Tuple
 
 
-from gym import spaces
-from PIL import Image, ImageGrab, ImageTk
-from typing import Any, Dict, Tuple
-
-
+from environment.capture import DEFAULT_APP_CLASS_NAME, DEFAULT_APP_WINDOW_NAME, FrameSpec, GameWindow
+from environment.flow import FlowConfig, GameFlow, default_flow_config
+from environment.screens import (
+    POINT_P_TEMPLATE, POINT_TEN_TEMPLATE,
+    STILL_DIFF, GameOverState, GameOverTracker, OnsetDetector, Screen, ScreenDetector, TemplateLibrary,
+    frame_motion, playfield_signature)
 from utils import cv2helper
-from utils.native import COMMAND_DICT, SCAN_ESC, SCAN_Z, SCAN_RIGHT, SCAN_LEFT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT, GetWindowRect, PressKey, ReleaseKey
+from utils.native import COMMAND_DICT, SCAN_Z, SCAN_RIGHT, SCAN_LEFT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT, HoldKeys, ReleaseKey
+
+
+logger = logging.getLogger(__name__)
+
+# 報酬。チャプタークリア・スペルカードボーナス・ステージクリアは、表示が始まった瞬間に1回だけ与える
+REWARD_CHAPTER_FINISH = 100
+REWARD_SPELL_CARD_BONUS = 500
+REWARD_STAGE_CLEAR = 1000
+REWARD_GAME_OVER = -100
+
+# プレイ中に現れない画面。これらが続いたら、エージェントの入力でメニューなどに入ってしまった (迷子) とみなす。
+# 例: 死亡の瞬間に押していたキーが攻略失敗メニューに届き、「操作説明」などが選ばれた場合は、
+# 攻略失敗の画面を一度も見ないまま、環境が操作説明の中でキーを押し続けることになる
+OFF_PLAY_SCREENS = frozenset({
+    Screen.MANUAL_MENU, Screen.TITLE, Screen.TITLE_GAME_START, Screen.MODE_SELECT, Screen.RANK_SELECT,
+    Screen.PLAYER_SELECT, Screen.PLAYER_SELECT_MISMATCH, Screen.RESUME_DIALOG})
+OFF_PLAY_STEPS = 3
+# 画面が止まったまま (操作説明の詳細画面のように HUD が残る静止画面) になったとみなすステップ数。
+# 1ステップは約0.13秒なので、約2.7秒。ステージクリア等の動く画面は最小でも 6 の動きがあるため、誤検出しない
+LOST_STILL_STEPS = 20
 
 
 class Kanjuden(gym.Env):
     """
-    「東方紺珠伝」向けカスタムGym環境
+    「東方紺珠伝」向けカスタムGymnasium環境
 
         - 目的：ゲームオーバーにならない
-        - 行動：ESCもしくは (Z, 8方向, Shift) の組み合わせ
+        - 行動：(Z, 8方向, Shift) の組み合わせ
         - 状態：画面イメージ
-        - 報酬：
-        - エピソード完了：
-
-    Parameters
-    ----------
-    gym : [type]
-        [description]
+        - 報酬：チャプタークリア・スペルカードボーナス・ステージクリア・アイテム取得で加点、ゲームオーバーで減点
+        - エピソード完了：ゲームオーバーまたはステージクリア (次の reset() でプレイ画面まで進める)
     """
-    def __command_start(self, response: int) -> None:
-        """
-        キーを押下する
-
-        Parameters
-        ----------
-        response : int
-            サーバレスポンス
-        """
-        if response in COMMAND_DICT:
-            for v in COMMAND_DICT[response]:
-                PressKey(v)
-    
-    def __command_end(self, response: int) -> None:
-        """
-        キーを離す
-
-        Parameters
-        ----------
-        response : int
-            サーバレスポンス
-        """
-        if response in COMMAND_DICT:
-            for v in COMMAND_DICT[response]:
-                ReleaseKey(v)
-    
-    def __press_and_release_key(self, hex_key_code: int) -> None:
-        """
-        適当なスリープを挟んでキーを押下する
-
-        Parameters
-        ----------
-        hex_key_code : int
-            キーコード
-        """
-        PressKey(hex_key_code)
-        time.sleep(4 * (1.0 / 60))
-        ReleaseKey(hex_key_code)
-        time.sleep(1)
+    metadata = {"render_modes": ["human"]}
 
     def _release_all_keys(self) -> None:
         """環境で使用し得る全てのキーを強制的に離す"""
         for key in {SCAN_Z, SCAN_LEFT, SCAN_RIGHT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT}:
             ReleaseKey(key)
 
-    def __init__(self, grid_size=[450, 384],
-                 app_class_name: str = "BASE",
-                 app_window_name: str = "東方紺珠伝　～ Legacy of Lunatic Kingdom. ver 1.00b",
+    def __init__(self,
+                 app_class_name: str = DEFAULT_APP_CLASS_NAME,
+                 app_window_name: str = DEFAULT_APP_WINDOW_NAME,
                  use_rgb: bool = False,
-                 shrink_ratio: float = 0.5,
-                 clip_top: int = 26,
-                 clip_bottom: int = 476,
+                 shrink_ratio: float = 1.0,
+                 clip_top: int = 16,
+                 clip_bottom: int = 466,
                  clip_left: int = 32,
-                 clip_right: int = 416) -> None:
+                 clip_right: int = 416,
+                 action_hold_frames: int = 4,
+                 flow_config: Optional[FlowConfig] = None,
+                 debug_dump_path: Optional[str] = None,
+                 render_mode: Optional[str] = None) -> None:
         """
         初期化処理
 
         Parameters
         ----------
-        grid_size : list, optional
-            グリッドサイズ, by default [450, 384]
         app_class_name : str, optional
             キャプチャ対象のウィンドウクラス名, by default BASE
         app_window_name : str, optional
             キャプチャ対象のウィンドウ名, by default 東方紺珠伝　～ Legacy of Lunatic Kingdom. ver 1.00b
         use_rgb : bool, optional
-            RGB画像を使う, by default False
+            RGB画像を観測に使う, by default False
         shrink_ratio : float, optional
-            画像縮小率, by default 0.5
+            観測画像の縮小率 (画面判定用の画像には影響しない), by default 1.0
         clip_top : int, optional
-            画像を切り取る位置 (top), by default 26
+            画像を切り取る位置 (top)。ゲーム本来の解像度 640x480 での座標, by default 16
         clip_bottom : int, optional
-            画像を切り取る位置 (bottom), by default 476
+            画像を切り取る位置 (bottom), by default 466
         clip_left : int, optional
             画像を切り取る位置 (left), by default 32
         clip_right : int, optional
             画像を切り取る位置 (right), by default 416
+        action_hold_frames : int, optional
+            1ステップでキーを押し続けるフレーム数, by default 4
+        flow_config : FlowConfig, optional
+            画面遷移 (タイトル〜プレイ開始、ゲームオーバーからのリトライ) の設定, by default default_flow_config()
+        debug_dump_path : str, optional
+            指定すると毎ステップの観測画像をこのパスに書き出す, by default None
+        render_mode : str, optional
+            "human" のみ対応, by default None
         """
         super(Kanjuden, self).__init__()
 
-        self.grid_size: np.ndarray = np.zeros(grid_size)
-        self.app_class_name = app_class_name
-        self.app_window_name = app_window_name
         self.use_rgb = use_rgb
-        self.shrink_ratio = shrink_ratio
-        self.clip_top = clip_top
-        self.clip_bottom = clip_bottom
-        self.clip_left = clip_left
-        self.clip_right = clip_right
+        self.action_hold_frames = action_hold_frames
+        self.debug_dump_path = debug_dump_path
+        self.render_mode = render_mode
+        self.current_screen: Optional[np.ndarray] = None
+        self._gray: Optional[np.ndarray] = None
+
+        spec = FrameSpec(use_rgb=use_rgb, shrink_ratio=shrink_ratio, clip_top=clip_top,
+                         clip_bottom=clip_bottom, clip_left=clip_left, clip_right=clip_right)
+        shape = spec.observation_shape
         self.action_space = spaces.Discrete(len(COMMAND_DICT) - 1)
-        self.observation_space = spaces.Box(
-            low=0, high=255, shape=self.grid_size.shape, dtype=np.float
-        )
-        self.previous_point_p_count = 0
-        self.previous_point_ten_count = 0
-        # --- Mission Incomplete (Game Over) 検出用状態 ---
-        # フェードインの早期段階での弱マッチを捕捉して入力を抑止する
-        self._mission_incomplete_template = cv2helper.imread(
-            "./environment/templates/template_mission_incomplete.png", 0
-        )
-        self._mi_soft_threshold = 0.80        # フェードイン初期用ソフト閾値
-        self._mi_hard_threshold = 0.95        # 従来確定判定用ハード閾値
-        self._mi_soft_required_frames = 5     # xz連続何フレームソフト閾値超で確定扱い
-        self._mi_soft_counter = 0
-        self._in_game_over_pending = False    # ソフト検出中 (入力抑止)
-        self._in_game_over_cooldown = 0       # クールダウン残フレーム
-        self.current_screen = None            # render安全用初期化
+        self.observation_space = spaces.Box(low=0, high=255, shape=shape, dtype=np.uint8)
 
-        # ウィンドウ座標取得 (これ以降ウィンドウの場所を変えないこと)
-        self.left, self.top, self.right, self.bottom = GetWindowRect(app_class_name, app_window_name)
+        self._window = GameWindow(app_class_name, app_window_name, spec)
+        self._templates = TemplateLibrary()
+        self._detector = ScreenDetector(self._templates)
+        self._game_over = GameOverTracker()
+        self._flow = GameFlow(
+            grab_gray=lambda: self._window.grab()[1],
+            press=lambda codes: HoldKeys(codes, 4),
+            detector=self._detector,
+            config=flow_config or default_flow_config())
+        self._chapter_finish = OnsetDetector()
+        self._spell_card_bonus = OnsetDetector()
+        self._stage_clear = OnsetDetector()
+        self._needs_advance = False
+        self._previous_signature: Optional[np.ndarray] = None
+        self._still_steps = 0
+        self._off_play_steps = 0
+        self._previous_point_p_count = 0
+        self._previous_point_ten_count = 0
 
-        print(f"==================================================")
-        print(f"Properties")
-        print(f"  grid_size      : {self.grid_size.shape}")
-        print(f"  app_class_name : {self.app_class_name}")
-        print(f"  app_window_name: {self.app_window_name}")
-        print(f"  use_rgb        : {self.use_rgb}")
-        print(f"  shrink_ratio   : {self.shrink_ratio}")
-        print(f"  clip           : {self.clip_left}, {self.clip_top}, {self.clip_right}, {self.clip_bottom}")
-        print(f"  rect           : {self.left}, {self.top}, {self.right}, {self.bottom}")
-        print(f"==================================================")
+        logger.info("app_class_name=%s app_window_name=%s use_rgb=%s", app_class_name, app_window_name, use_rgb)
+        logger.info("observation shape=%s client rect=(%d, %d, %d, %d)", shape,
+                    self._window.left, self._window.top, self._window.right, self._window.bottom)
 
-        # 初回起動: ゲーム開始まで自動遷移
-        self.fast_restart(initial=True)
-    
-    def reset(self) -> np.ndarray:
+        # 切り取り位置が画面の外にはみ出していると、学習が始まってから気付くことになる
+        observation, _ = self._window.grab()
+        if observation.shape != shape:
+            raise ValueError(
+                f"観測画像の大きさが想定と異なります: 実際 {observation.shape}, 想定 {shape}。"
+                "shrink_ratio / clip_* を確認してください。")
+
+        # 初回起動: プレイ画面まで自動遷移 (すでにプレイ画面なら何もしない)
+        self._window.focus()
+        self._release_all_keys()
+        self._flow.advance_to_playing()
+
+    def _grab(self) -> np.ndarray:
+        """画面を取得して観測画像を返す。画面判定用のグレー画像 (640x480 全体) は self._gray に保持する"""
+        observation, gray = self._window.grab()
+        self.current_screen = observation
+        self._gray = gray
+        if self.debug_dump_path:
+            cv2helper.imwrite(self.debug_dump_path, observation)
+        return observation
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+              ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         環境のリセット
 
+        前のエピソードがゲームオーバーかステージクリアで終わっていた場合は、プレイ画面になるまで
+        進めてから観測を返す。それ以外で呼ばれた場合は、ゲームには触れずに現在の画面を返す。
+
         Returns
         -------
-        numpy.ndarray
-            初期化後のグリッドのテンソル
+        Tuple[numpy.ndarray, Dict[str, Any]]
+            観測画像と info
+
+        Raises
+        ------
+        FlowError
+            プレイ画面まで進めなかった
         """
-        self.grid_size: np.ndarray = np.zeros([450, 384])
-        # GameOver関連状態をリセット
-        self._mi_soft_counter = 0
-        self._in_game_over_pending = False
-        self._in_game_over_cooldown = 0
-        return self._capture_observation()
-
-    # 観測キャプチャを共通化
-    def _capture_observation(self) -> np.ndarray:
-        img: Image = ImageGrab.grab((self.left, self.top, self.right, self.bottom), include_layered_windows=False, all_screens=True)
-        imgArray: np.ndarray = np.asarray(img, dtype='uint8')
-        if not self.use_rgb:
-            imgArray = cv2.cvtColor(imgArray, cv2.COLOR_BGR2GRAY)
-        imgArray = cv2.resize(imgArray, (int(imgArray.shape[1] * self.shrink_ratio), int(imgArray.shape[0] * self.shrink_ratio)))
-        imgArray = imgArray[self.clip_top:self.clip_bottom, self.clip_left:self.clip_right]
-        self.current_screen = imgArray.copy()
-        cv2helper.imwrite('current_screen.png', imgArray)
-        return imgArray
-
-    def fast_restart(self, initial: bool = False) -> np.ndarray:
-        """初回: メニューをゲーム開始まで進める / それ以降: ESCでリトライ画面確定 (想定)"""
+        super().reset(seed=seed)
         self._release_all_keys()
-        if initial:
-            sequence = [SCAN_Z, SCAN_Z, SCAN_Z, SCAN_Z, SCAN_RIGHT, SCAN_Z]
-        else:
-            sequence = [SCAN_ESC]
-        for code in sequence:
-            self.__press_and_release_key(code)
-            time.sleep(2 * (1.0/60))
-        # 状態初期化
-        self._mi_soft_counter = 0
-        self._in_game_over_pending = False
-        self._in_game_over_cooldown = 0
-        return self._capture_observation()
+        if self._needs_advance:
+            self._window.focus()
+            self._flow.advance_to_playing()
+            self._needs_advance = False
+        self._game_over.reset()
+        for onset in (self._chapter_finish, self._spell_card_bonus, self._stage_clear):
+            onset.reset()
+        self._previous_point_p_count = 0
+        self._previous_point_ten_count = 0
+        self._previous_signature = None
+        self._still_steps = 0
+        self._off_play_steps = 0
+        return self._grab(), {}
 
-    def step(self, action: Any) -> Tuple[Any, float, bool, Dict[str, Any]]:
+    def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
         環境の1ステップ実行
 
         Parameters
         ----------
         action : Any
-            [description]
+            COMMAND_DICT のキー (0〜17)
 
         Returns
         -------
-        Tuple[Any, float, bool, Dict[str, Any]]
-            [description]
+        Tuple[numpy.ndarray, float, bool, bool, Dict[str, Any]]
+            観測画像, 報酬, terminated, truncated, info
         """
         info: Dict[str, Any] = {}
-        suppress_input = self._in_game_over_pending  # クールダウンは学習側へ移譲
-        if suppress_input:
+        # ゲームオーバーのフェードイン中に入力すると、メニュー操作の取りこぼしや誤入力になる
+        if self._game_over.state is GameOverState.SOFT:
             self._release_all_keys()
         else:
-            self.__command_start(action)
-            self.__command_end(action)
+            HoldKeys(COMMAND_DICT.get(int(action), []), self.action_hold_frames)
 
-        imgArray = self._capture_observation()
+        observation = self._grab()
+        gray = self._gray
+        detection = self._detector.detect(gray)
+        # 報酬用のアイコンは、HUD側に同じ絵があるため自機エリアだけで照合する
+        playfield = self._detector.playfield(gray)
 
-        observation: np.ndarray = np.zeros(self.grid_size.shape)
         reward = 0
-        done = False
-        observation = imgArray.copy()
-        self.current_screen = imgArray.copy()
+        terminated = False
+        events = []
 
-        # テンプレートマッチングによる報酬計算
-        # Chapter Finish
-        cf_templates = [
-            "template_chapter_finish_1.png",
-            "template_chapter_finish_2.png",
-            "template_chapter_finish_3.png",
-            "template_chapter_finish_4.png",
-            "template_chapter_finish_5.png"
-        ]
-        for cf_template in cf_templates:
-            img_template = cv2helper.imread(f"./environment/templates/{cf_template}", 0)
-            result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
-            # min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-            if len(np.where(result >= 0.95)[0]) > 0:
-                print(f"Chapter Finished detected by {cf_template}")
-                reward = 100
-                break
-            else:
-                continue
-        
-        # Spell Card Bonus
+        if self._chapter_finish.update(Screen.CHAPTER_FINISH in detection.overlays):
+            logger.info("Chapter Finish detected")
+            reward += REWARD_CHAPTER_FINISH
+            events.append("chapter_finish")
+
+        if self._spell_card_bonus.update(Screen.SPELL_CARD_BONUS in detection.overlays):
+            logger.info("Spell Card Bonus detected")
+            reward += REWARD_SPELL_CARD_BONUS
+            events.append("spell_card_bonus")
+
+        if self._stage_clear.update(Screen.STAGE_CLEAR in detection.overlays):
+            logger.info("Stage Clear detected")
+            reward += REWARD_STAGE_CLEAR
+            terminated = True
+            self._needs_advance = True
+            events.append("stage_clear")
+
+        # 霊力・得点は、画面内のアイコン数が前回より増えた分だけ加点する
         if reward == 0:
-            img_template = cv2helper.imread("./environment/templates/template_get_spell_card_bonus.png", 0)
-            result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
-            if len(np.where(result >= 0.95)[0]) > 0:
-                print("Spell Card Bonus detected")
-                reward = 500
-        
-        # 霊力
-        # 現在の画面と templates/point_p.png のテンプレートマッチングを行い、
-        # 前回の画面と比較して増えていたらマッチした数だけ+1の報酬を与える
+            current = self._templates.count(playfield, POINT_P_TEMPLATE)
+            reward = max(current - self._previous_point_p_count, 0)
+            self._previous_point_p_count = current
+
         if reward == 0:
-            img_template = cv2helper.imread("./environment/templates/template_point_p.png", 0)
-            result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
-            current_p_count = len(np.where(result >= 0.95)[0])
-            if current_p_count > 0 and current_p_count > self.previous_point_p_count:
-                print("Point +1 detected")
-                reward = 1 * (current_p_count - self.previous_point_p_count)
+            current = self._templates.count(playfield, POINT_TEN_TEMPLATE)
+            reward = max(current - self._previous_point_ten_count, 0)
+            self._previous_point_ten_count = current
 
-        # 得点
-        # 現在の画面と templates/point_ten.png のテンプレートマッチングを行い、
-        # 前回の画面と比較して増えていたらマッチした数だけ+1の報酬を与える
-        if reward == 0:
-            img_template = cv2helper.imread("./environment/templates/template_point_ten.png", 0)
-            result = cv2.matchTemplate(imgArray, img_template, cv2.TM_CCOEFF_NORMED)
-            current_ten_count = len(np.where(result >= 0.95)[0])
-            if current_ten_count > 0 and current_ten_count > self.previous_point_ten_count:
-                print("Ten +1 detected")
-                reward = 1 * (current_ten_count - self.previous_point_ten_count)
+        if self._game_over.update(detection.game_over_score) is GameOverState.HARD:
+            reward = REWARD_GAME_OVER
+            terminated = True
+            self._needs_advance = True
+            events.append("game_over")
+            info["game_over_confidence"] = detection.game_over_score
 
-        # Mission Incomplete (Game Over) 検出 (フェードイン対応)
-        if reward == 0:
-            # 事前読込済テンプレートを使用
-            result = cv2.matchTemplate(imgArray, self._mission_incomplete_template, cv2.TM_CCOEFF_NORMED)
-            _min_val, max_val, _min_loc, _max_loc = cv2.minMaxLoc(result)
+        # 攻略失敗を見逃したまま、メニューなどの中に入ってしまった場合 (迷子)。エピソードを終え、
+        # 次の reset() で遷移制御が Esc で戻す。入ってしまうのは死亡の直後なので、ゲームオーバーとして扱う
+        signature = playfield_signature(gray)
+        if self._previous_signature is not None and frame_motion(self._previous_signature, signature) < STILL_DIFF:
+            self._still_steps += 1
+        else:
+            self._still_steps = 0
+        self._previous_signature = signature
+        self._off_play_steps = self._off_play_steps + 1 if detection.screen in OFF_PLAY_SCREENS else 0
+        if (not terminated and detection.screen is not Screen.GAME_OVER
+                and (self._still_steps >= LOST_STILL_STEPS or self._off_play_steps >= OFF_PLAY_STEPS)):
+            logger.warning("プレイ画面から外れました (画面=%s, 静止 %d ステップ)。エピソードを終了します。",
+                           detection.screen.value, self._still_steps)
+            reward = REWARD_GAME_OVER
+            terminated = True
+            self._needs_advance = True
+            self._still_steps = self._off_play_steps = 0
+            events.extend(["game_over", "lost"])
+            info["lost"] = True
 
-            if max_val >= self._mi_hard_threshold:
-                # ハード閾値到達で確定
-                print(f"Mission Incomplete HARD detected (val={max_val:.3f})")
-                reward = -100
-                done = True
-                self._mi_soft_counter = 0
-                self._in_game_over_pending = False
-                info["game_over_state"] = "hard"
-                info["game_over_confidence"] = max_val
-                info["restart_ready"] = True
-                info["input_allowed"] = False
-            else:
-                if max_val >= self._mi_soft_threshold:
-                    # ソフト検出域
-                    self._mi_soft_counter += 1
-                    if not self._in_game_over_pending:
-                        print(f"Mission Incomplete SOFT start (val={max_val:.3f}) -> suppress inputs")
-                    self._in_game_over_pending = True
-                    if self._mi_soft_counter >= self._mi_soft_required_frames:
-                        # 規定フレーム継続で確定昇格
-                        print(f"Mission Incomplete promoted from SOFT to HARD (counter={self._mi_soft_counter}, val={max_val:.3f})")
-                        reward = -100
-                        done = True
-                        self._mi_soft_counter = 0
-                        self._in_game_over_pending = False
-                        info["game_over_state"] = "hard"
-                        info["game_over_confidence"] = max_val
-                        info["restart_ready"] = True
-                        info["input_allowed"] = False
-                else:
-                    # 閾値未満: ソフト状態解除
-                    if self._in_game_over_pending:
-                        print(f"Mission Incomplete soft canceled (val={max_val:.3f})")
-                    self._mi_soft_counter = 0
-                    self._in_game_over_pending = False
+        info["events"] = events
+        state = self._game_over.state
+        info["game_over_state"] = state.value
+        info["restart_ready"] = state is GameOverState.HARD
+        info["input_allowed"] = state is GameOverState.NONE
 
-        if "game_over_state" not in info:
-            if self._in_game_over_pending:
-                info["game_over_state"] = "soft"
-                info["restart_ready"] = False
-                info["input_allowed"] = False
-            else:
-                info["game_over_state"] = "none"
-                info["restart_ready"] = False
-                info["input_allowed"] = True
+        return observation, reward, terminated, False, info
 
-        return observation, reward, done, info
-
-    def render(self, mode='console') -> None:
-        """
-        環境の描画
-
-        Parameters
-        ----------
-        mode : str, optional
-            [description], by default 'console'
-        """
+    def render(self) -> None:
+        """環境の描画 (render_mode="human" のみ)"""
         if self.current_screen is None:
             raise ValueError("You must specify image source.")
 
-        if mode == 'human':
-            h, w = self.current_screen.shape
-            # TODO: 霊力・得点の座標検出（速度次第…）
-            root = tkinter.Tk()
-            root.title("東方紺珠伝 - toho-ml-python")
-            root.geometry(f"{w}x{h}")
-            img_pil = Image.fromarray(self.current_screen)
-            img_tk = ImageTk.PhotoImage(img_pil)
-            canvas = tkinter.Canvas(root, width=w, height=h)
-            canvas.pack()
-            canvas.create_image(0, 0, image=img_tk, anchor='nw')
-            root.mainloop()
+        if self.render_mode != 'human':
+            return
 
-        else:
-            raise NotImplementedError(f"Not support render for mode {mode}.")
+        h, w = self.current_screen.shape[:2]
+        # TODO: 霊力・得点の座標検出（速度次第…）
+        root = tkinter.Tk()
+        root.title("東方紺珠伝 - toho-ml-python")
+        root.geometry(f"{w}x{h}")
+        img_pil = Image.fromarray(self.current_screen)
+        img_tk = ImageTk.PhotoImage(img_pil)
+        canvas = tkinter.Canvas(root, width=w, height=h)
+        canvas.pack()
+        canvas.create_image(0, 0, image=img_tk, anchor='nw')
+        root.mainloop()
+
+    def close(self) -> None:
+        """押しっぱなしのキーが残らないようにする"""
+        self._release_all_keys()

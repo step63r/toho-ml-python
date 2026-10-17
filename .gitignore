@@ -154,3 +154,7 @@ cython_debug/
 
 
 current_screen.png
+captures/
+
+jev_probe_out/
+bench_out/
