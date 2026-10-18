@@ -235,6 +235,30 @@ def model_params(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def check_start_paths(out_dir: Path, resume: Optional[Path]) -> Optional[str]:
+    """
+    学習を始める前 (ゲームにキーを送る前) の、保存先と再開元の検査。問題があれば、そのメッセージを返す
+
+    再開元が無いのに始めると、メニューを進めたあとで失敗する。再開せずに保存のある出力先で始めると、
+    次の中断で前回の保存 (interrupted.zip) を上書きしてしまう。
+    """
+    out_dir = Path(out_dir)
+    if resume is not None:
+        if not Path(resume).is_file():
+            saved = sorted(p.name for p in out_dir.glob("*.zip")) + sorted(
+                f"checkpoints\\{p.name}" for p in (out_dir / "checkpoints").glob("*.zip"))
+            return (f"--resume のファイルが見つかりません: {resume}\n"
+                    "interrupted.zip は、学習を中断または異常終了したときに作られます。最初の学習は --resume なしで実行してください。\n"
+                    + (f"{out_dir} にあるモデル: {', '.join(saved)}" if saved else f"{out_dir} にはまだモデルがありません。"))
+        return None
+    existing = [name for name in ("interrupted.zip", "final.zip") if (out_dir / name).exists()]
+    if existing:
+        return (f"{out_dir} には、すでに保存があります ({', '.join(existing)})。\n"
+                f"続きから学習するなら --resume {out_dir / existing[0]} を付けてください。"
+                "最初からやり直すなら、--out_dir を変えるか、保存を別の場所に移してください (上書きを避けるため、始めません)。")
+    return None
+
+
 def main() -> None:
     from environment.shanghai_alice_15th import Kanjuden
     from tools.common import add_window_args, open_window
@@ -263,6 +287,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
+    problem = check_start_paths(args.out_dir, args.resume)
+    if problem:
+        parser.error(problem)                        # ゲームにキーを送る前に終わる
     args.out_dir.mkdir(parents=True, exist_ok=True)
     log_path = setup_logging(args.out_dir)           # open_window の basicConfig より先に
     open_window(args)                                # ウィンドウの存在確認

@@ -251,3 +251,38 @@ def test_学習の進捗は_ターミナルではなくログファイルとprog
     out = capsys.readouterr()
     assert "ep_len_mean" not in out.out and "ep_len_mean" not in out.err
     assert list((tmp_path / "tb").glob("run_*/progress.csv"))
+
+
+def test_再開元が無ければ_ゲームを触る前にメッセージで終わる(tmp_path):
+    message = train_dqn.check_start_paths(tmp_path, tmp_path / "interrupted.zip")
+
+    assert "見つかりません" in message and "--resume なし" in message
+    assert "まだモデルがありません" in message
+
+
+def test_再開元が無いとき_ある保存を案内する(tmp_path):
+    (tmp_path / "checkpoints").mkdir()
+    (tmp_path / "checkpoints" / "dqn_10000_steps.zip").write_text("")
+
+    message = train_dqn.check_start_paths(tmp_path, tmp_path / "interrupted.zip")
+
+    assert "dqn_10000_steps.zip" in message
+
+
+def test_再開元があれば問題なし(tmp_path):
+    (tmp_path / "interrupted.zip").write_text("")
+
+    assert train_dqn.check_start_paths(tmp_path, tmp_path / "interrupted.zip") is None
+
+
+def test_再開せずに保存のある出力先で始めると_上書きを避けて止める(tmp_path):
+    (tmp_path / "interrupted.zip").write_text("")
+
+    message = train_dqn.check_start_paths(tmp_path, None)
+
+    assert "--resume" in message and "interrupted.zip" in message and "上書き" in message
+
+
+def test_空の出力先なら最初から始められる(tmp_path):
+    assert train_dqn.check_start_paths(tmp_path, None) is None
+    assert train_dqn.check_start_paths(tmp_path / "new", None) is None
