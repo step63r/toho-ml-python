@@ -414,6 +414,10 @@ def main() -> None:
     parser.add_argument("--resume", type=Path, default=None, help="保存したモデル (.zip) から続きを学習する")
     parser.add_argument("--checkpoint_every", type=int, default=10_000)
     parser.add_argument("--n_stack", type=int, default=4)
+    parser.add_argument("--step_period_sec", type=float, default=None,
+                        help="指定すると、1 ステップを固定の長さにして、方向・Shift を次のステップまで押しっぱなしにする "
+                             "(人のプレイの記録 tools.record_demo と同じ動き。記録を使う学習では、記録の周期 0.133 と同じにする)。"
+                             "再開でも、前回と同じ値を指定すること")
     parser.add_argument("--reward_scale", type=float, default=0.01)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--buffer_size", type=int, default=100_000, help="1 件あたり約 43KB (112x96x4)。10 万件で約 4.3GB")
@@ -456,7 +460,7 @@ def main() -> None:
     def env_factory() -> gym.Env:
         return Kanjuden(app_class_name=args.app_class_name, app_window_name=args.app_window_name,
                         shrink_ratio=args.shrink_ratio, clip_top=args.clip_top, clip_bottom=args.clip_bottom,
-                        clip_left=args.clip_left, clip_right=args.clip_right,
+                        clip_left=args.clip_left, clip_right=args.clip_right, step_period_sec=args.step_period_sec,
                         diagnostics_dir=str(Path("diagnostics_out")))
 
     venv = build_vec_env(env_factory, args.out_dir, args.n_stack, args.reward_scale)

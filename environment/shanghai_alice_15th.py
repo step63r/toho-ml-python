@@ -1,12 +1,13 @@
 import gymnasium as gym
 import logging
 import numpy as np
+import time
 import tkinter
 
 from gymnasium import spaces
 from pathlib import Path
 from PIL import Image, ImageTk
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
 from environment.capture import DEFAULT_APP_CLASS_NAME, DEFAULT_APP_WINDOW_NAME, FrameSpec, GameWindow
@@ -116,7 +117,8 @@ class Kanjuden(gym.Env):
                  diagnostics_dir: Optional[str] = None,
                  render_mode: Optional[str] = None,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 auto_advance: bool = True) -> None:
         """
         初期化処理
 
@@ -155,6 +157,9 @@ class Kanjuden(gym.Env):
             dump_diagnostics() の呼び出しのときにこのディレクトリに書き出す, by default None
         render_mode : str, optional
             "human" のみ対応, by default None
+        auto_advance : bool, optional
+            False にすると、初期化でメニューを進めず、ゲームにキーを一切送らない (人のプレイの記録 tools.record_demo 用。
+            この場合、observe() だけを使う), by default True
         """
         super(Kanjuden, self).__init__()
 
@@ -217,9 +222,10 @@ class Kanjuden(gym.Env):
                 "shrink_ratio / clip_* を確認してください。")
 
         # 初回起動: プレイ画面まで自動遷移 (すでにプレイ画面なら何もしない)
-        self._window.focus()
-        self._release_all_keys()
-        self._flow.advance_to_playing()
+        if auto_advance:
+            self._window.focus()
+            self._release_all_keys()
+            self._flow.advance_to_playing()
 
     def _grab(self) -> np.ndarray:
         """画面を取得して観測画像を返す。画面判定用のグレー画像 (640x480 全体) は self._gray に保持する"""
@@ -262,7 +268,10 @@ class Kanjuden(gym.Env):
         self._previous_signature = None
         self._still_steps = 0
         self._off_play_steps = 0
-        return self._grab(), {}
+        observation = self._grab()
+        # 固定周期のモードで、最初のステップも、次の撮影まで一周期分キーを押したままにするため
+        self._last_capture_at = self._clock()
+        return observation, {}
 
     def step(self, action: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
@@ -352,7 +361,7 @@ class Kanjuden(gym.Env):
         self._off_play_steps = self._off_play_steps + 1 if detection.screen in OFF_PLAY_SCREENS else 0
         if self._step_recorder:
             self._step_recorder.record(
-                gray, action=int(action), screen=detection.screen.value, game_over_score=round(detection.game_over_score, 3),
+                gray, action=-1 if action is None else int(action), screen=detection.screen.value, game_over_score=round(detection.game_over_score, 3),
                 motion=None if motion is None else round(motion, 3), still_steps=self._still_steps,
                 off_play_steps=self._off_play_steps)
         if (not terminated and detection.screen is not Screen.GAME_OVER
@@ -368,6 +377,9 @@ class Kanjuden(gym.Env):
             info["lost"] = True
 
         info["events"] = events
+        # 判定した画面と攻略失敗の一致率。人のプレイの記録 (tools.record_demo) が、フレームごとに残す
+        info["screen"] = detection.screen.value
+        info["game_over_score"] = detection.game_over_score
         state = self._game_over.state
         info["game_over_state"] = state.value
         info["restart_ready"] = state is GameOverState.HARD

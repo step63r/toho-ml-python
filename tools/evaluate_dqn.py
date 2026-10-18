@@ -99,6 +99,8 @@ def main() -> None:
     parser.add_argument("--epsilon", type=float, default=0.0, help="学習した方策にランダムな行動を混ぜる割合")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--n_stack", type=int, default=4)
+    parser.add_argument("--step_period_sec", type=float, default=None,
+                        help="学習したときと同じ値を指定する (固定周期のモード。ランダム方策と比べるときは、両方に同じ値を指定する)")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--out_dir", type=Path, default=Path("train_out") / "eval")
     args = parser.parse_args()
@@ -114,7 +116,7 @@ def main() -> None:
     def env_factory():
         return Kanjuden(app_class_name=args.app_class_name, app_window_name=args.app_window_name,
                         shrink_ratio=args.shrink_ratio, clip_top=args.clip_top, clip_bottom=args.clip_bottom,
-                        clip_left=args.clip_left, clip_right=args.clip_right)
+                        clip_left=args.clip_left, clip_right=args.clip_right, step_period_sec=args.step_period_sec)
 
     venv = build_vec_env(env_factory, args.out_dir, args.n_stack)
     rng = np.random.default_rng()

@@ -561,3 +561,118 @@ def test_resetでZを離し_次のステップで押し直す(keys):
 def test_fire_period_stepsは2以上(keys):
     with pytest.raises(ValueError, match="fire_period_steps"):
         make_env(fire_period_steps=1)
+
+
+class FakeClock:
+    """sleep で進む時計。撮影やキー入力の時間は進まないので、周期の待ちが毎回まるごと入る"""
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.sleeps = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def moves(events, since: int):
+    """since 件目以降の、Z 以外のキーの押下・解放"""
+    return [(kind, code) for kind, code in events[since:] if code != SCAN_Z]
+
+
+def test_固定周期のモードでは_方向とShiftを押しっぱなしにして_行動が変わったキーだけ押し直す(keys):
+    from utils.native import SCAN_LSHIFT, SCAN_RIGHT, SCAN_UP
+    fake = FakeClock()
+    env = make_env(step_period_sec=0.1, clock=fake.clock, sleep=fake.sleep)
+    env.reset()
+    FakeWindow.key_events.clear()
+    keys.clear()
+    seen = 0
+    per_step = []
+
+    for action in (2, 2, 6, 11, 0):          # 上 → 上 → 上+右 → Shift+上 → 何も押さない
+        env.step(action)
+        per_step.append(moves(FakeWindow.key_events, seen))
+        seen = len(FakeWindow.key_events)
+
+    assert keys == []                          # HoldKeys (押して離す) は使わない
+    assert per_step[0] == [("down", SCAN_UP)]
+    assert per_step[1] == []                   # 同じ行動なら、何もしない
+    assert per_step[2] == [("down", SCAN_RIGHT)]
+    assert set(per_step[3]) == {("up", SCAN_RIGHT), ("down", SCAN_LSHIFT)}      # 右を離し、Shift を押す。上は押したまま
+    assert set(per_step[4]) == {("up", SCAN_UP), ("up", SCAN_LSHIFT)}
+
+
+def test_固定周期のモードでは_最初のステップも含めて_毎回一周期分待ってから撮る(keys):
+    fake = FakeClock()
+    env = make_env(step_period_sec=0.133, clock=fake.clock, sleep=fake.sleep)
+    env.reset()
+
+    for _ in range(3):
+        env.step(0)
+
+    assert fake.sleeps == [pytest.approx(0.133)] * 3
+
+
+def test_固定周期のモードで_処理に時間がかかった分は_待ちから引く(keys):
+    fake = FakeClock()
+    env = make_env(step_period_sec=0.133, clock=fake.clock, sleep=fake.sleep)
+    env.reset()
+
+    fake.now += 0.1                            # 方策の計算などで 0.1 秒かかった
+    env.step(0)
+    fake.now += 0.5                            # 周期を超えた場合は、待たない
+    env.step(0)
+
+    assert fake.sleeps == [pytest.approx(0.033)]
+
+
+def test_resetは押しっぱなしの方向キーを離す(keys):
+    from utils.native import SCAN_UP
+    fake = FakeClock()
+    env = make_env(step_period_sec=0.1, clock=fake.clock, sleep=fake.sleep)
+    env.reset()
+    env.step(2)
+    FakeWindow.key_events.clear()
+
+    env.reset()
+
+    assert ("up", SCAN_UP) in FakeWindow.key_events
+    FakeWindow.key_events.clear()
+    env.step(2)
+    assert ("down", SCAN_UP) in FakeWindow.key_events            # 離したので、また押す
+
+
+def test_step_period_secは正の値(keys):
+    with pytest.raises(ValueError, match="step_period_sec"):
+        make_env(step_period_sec=0)
+
+
+def test_observeはキーを送らず_今の画面から報酬と終了を求める(keys):
+    env = make_env()
+    env.reset()
+    keys.clear()
+    FakeWindow.key_events.clear()
+
+    observation, reward, terminated, _, info = env.observe()
+    assert (reward, terminated) == (0, False) and env.observation_space.contains(observation)
+
+    FakeWindow.instance.show(Screen.GAME_OVER)               # 人が死んだ場面
+    _, reward, terminated, _, info = env.observe()
+
+    assert (reward, terminated) == (env_module.REWARD_GAME_OVER, True) and "game_over" in info["events"]
+    assert keys == [] and FakeWindow.key_events == []
+
+
+def test_auto_advanceを切ると_初期化でメニューを進めず_キーを一切送らない(keys):
+    FakeWindow.initial_screen = Screen.TITLE_GAME_START
+
+    env = make_env(auto_advance=False)
+    observation, reward, terminated, _, info = env.observe()          # reset() なしで、そのまま観測できる
+
+    assert keys == [] and FakeWindow.key_events == []
+    assert FakeWindow.instance.screen is Screen.TITLE_GAME_START
+    assert (reward, terminated) == (0, False) and info["screen"] == "title_game_start"
+    assert env.observation_space.contains(observation)
