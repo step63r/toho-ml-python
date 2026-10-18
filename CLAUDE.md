@@ -109,7 +109,28 @@
 - **環境** (`environment/shanghai_alice_15th.py`): Gymnasium 環境 `Kanjuden`。報酬は、Chapter Finish +100、スペルカードボーナス +500、ステージクリア +1000 (終了)、ゲームオーバー −100 (終了)。表示の開始時に 1 回だけ与える (`OnsetDetector`)。
 - **道具** (`tools/`): `capture` (撮影)、`watch_screen` (判定のライブ表示)、`run_flow` (今の画面からプレイ画面まで進める)、`bench_env` (ランダム方策のベースライン)、`build_template` (マスク作成)、`jev_probe` (Jev の実測)。
 
-**まだ無いもの:** 学習 (PyTorch・stable-baselines3 は**未導入**)。`main.py` は旧コード (PPO) のままで動作未確認。
+**学習スクリプト (実装済み、実機では未実行):** `python -m tools.train_dqn` (`tools/train_dqn.py`、観測・報酬のラッパーは `environment/wrappers.py`)。
+観測は `shrink_ratio=0.25` の 112x96 グレーを 4 枚重ねる (弾を見分けられるかは**未検証**)。報酬は 0.01 倍 (死亡 -1)。SB3 の DQN (CnnPolicy)、
+バッファ 10 万件 (約 4.3GB、`optimize_memory_usage`)、学習開始 1 万ステップ、探索率は全体の 30% で 1.0→0.05。目標は既定 30 万ステップ (約 11 時間)。
+中断: Ctrl+C か `train_out\default\STOP` ファイルの作成。どちらも、モデルとリプレイバッファを `interrupted.zip` / `interrupted_replay_buffer.pkl` に保存する
+(異常終了でも保存して例外を送出)。`--resume` で、ステップ数・バッファ・探索率の計画を引き継いで再開する。定期保存は `--checkpoint_every` (既定 1 万ステップ) ごとに、モデルのみ `checkpoints/` に保存。エピソードごとの記録は `monitor_*.monitor.csv`、tensorboard は `train_out/tb`。
+**ログ:** 学習の経過 (`logging` と SB3 の進捗の表) は、ターミナルではなく `<out_dir>/train.log` に書く (再開しても追記。ターミナルは開始・終了・エラーだけ)。
+SB3 の表と同じ値は `tb/run_<時刻>/progress.csv` と tensorboard にも出る。見るには `Get-Content train_out\default	rain.log -Wait -Tail 40`。
+偽の環境での検証 (`tests/test_train_dqn.py`、13 件): 目標まで学習・STOP・Ctrl+C・例外・再開 (バッファあり/なし)。GPU での学習更新は 1 ステップあたり約 3 ms (偽の環境)。
+**実機での短い学習 (スモークテスト、2026-10-18、確認済み):** `--total_steps 3000` を、175 ステップで Ctrl+C → `--resume` で再開 → 3003 ステップで `final.zip`。
+中断・保存・再開 (バッファ 175 件を引き継ぎ) が動いた。学習の更新も動いた (loss は 0.0005〜0.02)。`FlowError` なし。約 5 steps/s (復旧の時間を含む。
+ランダム方策の単体では 7.5 steps/s)。`ep_len_mean` は 39→55 ステップ (ランダム方策の中央値 5.4 秒 ≒ 41 ステップと同程度。3000 ステップでは判断できない)。
+死亡約 59 回のうち、タイトルへ漏れたのは 4 回 (約 7%、Z の押し直しのステップ)。Ctrl+C のためにターミナルをクリックすると、ゲームが前面から外れて、
+遷移制御の Esc がターミナルに届く (中断の直前に Esc が効かなかった)。**ゲームを前面に置いたまま止めるには、STOP ファイルを使う。**
+観測 (0.25 倍・112x96): 保存フレームで見ると、白い丸い弾は 1〜2 ピクセルの点として残り、アイテムも見分けられる (人の目で見た確認。学習で使えるかは未検証)。
+エピソードの最初の約 1 秒は、リトライの演出 ("Restart" のチェック模様と、自機の出現のリング) を観測している。
+ログの「画面: game_over」の誤表示 (タイトルの選択画面の遷移中) は、攻略失敗の保持 (`answer_hold_sec`) が UNKNOWN の遷移フレームを攻略失敗と
+みなしたもの。Esc を誤って押す恐れがあったので、`answer_cancel_screens` (タイトル・選択画面を検出したら保持を解除) を足した (テストのみ、実機では未確認)。
+**未検証:** 長時間の学習 (学習が進むか)、ステージ 1 のボス・会話の通過、`FlowError` で止まったときの自動復旧 (今は保存して終了)。
+`main.py` は旧コード (PPO) のままで動作未確認。評価用のスクリプトは未実装。
+**導入済み (2026-10-18、ユーザー承認):** torch 2.14.1+cu130 (GPU で演算できることを確認)・stable-baselines3 2.9.0・tensorboard 2.21.0 (`requirements-rl.txt`)。
+導入の副作用: `.venv` の setuptools が 65.5.0 → 78.1.0 に上がった (torch の依存)。`check_env` (SB3) は、偽のウィンドウの環境で例外なし。
+警告: 観測 (450, 384) の 2 次元は、画像でも 1 次元でもない形。`CnnPolicy` には (チャンネル, 高さ, 幅) の形 (フレームスタック) が要る。
 
 **ベースライン (中断した実行、2〜3 エピソード):** ステップ速度 約 7.5 steps/s (画面取得 平均 50.6ms・判定 6.2ms・キー保持 66.7ms)。ランダム方策の生存は約 2〜54 秒 (ゲームオーバーまで、計 5 エピソード)。
 
@@ -117,7 +138,7 @@
 1. (済) 迷子からの復帰。残りは、死亡の瞬間のキー漏れを減らすこと (復帰に実行時間の約半分を使っている)。
 2. (済) ベースラインの取り直し (上記の数字)。
 3. 速度: 画面取得 (`ImageGrab`) が約 38%。必要なら高速な取得 (dxcam など。依存の追加は**ユーザー承認が必要**)。
-4. DQN の学習環境: PyTorch (CUDA)・stable-baselines3・tensorboard (**承認が必要**)。観測は自機エリアの縮小グレー + フレームスタック、報酬の正規化、評価、チェックポイント。
+4. (済) DQN の学習環境: 導入・観測のラッパー・学習スクリプト (中断・再開あり)。残り: 実機での短い学習 (数千ステップ) の動作確認、評価スクリプト。
 5. サンプル効率: 人間のプレイ (画面+キー) の記録による事前学習 (任意、ユーザーにプレイしてもらう)。
 6. 評価: ランダム基準と比べた生存時間、チャプター突破率。画素 DQN で全ステージ突破は研究的に難しい。まず「ランダムより明確に長く生きる」ことを示す。
 
@@ -151,5 +172,6 @@ python -m pytest                                   # テスト (ゲーム不要)
 python -m tools.watch_screen                       # 判定のライブ表示 (入力は送らない)
 python -m tools.run_flow                           # 今の画面からプレイ画面まで進める (キーを送る)
 python -m tools.bench_env --episodes 10 --max_episode_seconds 120   # ランダム方策のベースライン (キーを送る)
+python -m tools.train_dqn --total_steps 300000     # DQN の学習 (キーを送る。Ctrl+C か train_out\default\STOP で中断、--resume で再開)
 python -m tools.capture --interval 0.5             # F8 または定期で撮影 (captures/)
 ```

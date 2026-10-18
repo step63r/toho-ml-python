@@ -540,3 +540,28 @@ def test_攻略失敗の後にタイトルへ出たら_経過を保存する(tmp
     assert len(dumped) == 1
     rows = json.loads((dumped[0] / "frames.json").read_text(encoding="utf-8"))
     assert rows[0]["screen"] == "game_over" and rows[-1]["screen"] == "title"      # 保存はタイトルの最初のフレームを含む
+
+
+def test_タイトルに戻った後の選択画面の遷移を_保持で攻略失敗とみなして_Escを押さない():
+    # 実機のログ: 「ゲームを終了」でタイトルに戻った後、選択画面の遷移 (UNKNOWN) が「game_over」と表示された
+    go, title, unknown = Screen.GAME_OVER, Screen.TITLE_GAME_START, Screen.UNKNOWN
+    script = [(go, False)] * 2 + [(title, False)] * 2 + [(unknown, True)] * 12 + [(Screen.PLAYING, True)] * 10
+    config = default_flow_config()
+
+    game = ScriptedGame(script)
+    make_flow(game, dict(config.keys), answer_required=config.answer_required,
+              answer_cancel_screens=config.answer_cancel_screens).advance_to_playing()
+
+    assert game.codes == []
+
+
+def test_answer_cancel_screensが空なら_選択画面の遷移を攻略失敗とみなしてEscを押す():
+    # 上の挙動が answer_cancel_screens によるものであることの確認
+    go, title, unknown = Screen.GAME_OVER, Screen.TITLE_GAME_START, Screen.UNKNOWN
+    script = [(go, False)] * 2 + [(title, False)] * 2 + [(unknown, True)] * 12 + [(Screen.PLAYING, True)] * 10
+    config = default_flow_config()
+
+    game = ScriptedGame(script)
+    make_flow(game, dict(config.keys), answer_required=config.answer_required).advance_to_playing()
+
+    assert game.codes == [(SCAN_ESC,)]

@@ -55,6 +55,10 @@ class FlowConfig:
     # メニューのフェードなどで判定が外れた隙に、入力せずにプレイ画面扱いで抜けると、方策の入力がメニューに入ってしまう
     answer_required: Tuple[Screen, ...] = ()
     answer_hold_sec: float = 5.0
+    # これらの画面を検出したら、入力を待っている画面は終わったものとして、保持を解除する。
+    # 攻略失敗から「ゲームを終了」でタイトルに戻った後の、選択画面の遷移 (UNKNOWN) を、保持で攻略失敗とみなして
+    # Esc (タイトルではカーソルが Quit に飛び、選択画面では一つ戻る) を押してしまわないため
+    answer_cancel_screens: Tuple[Screen, ...] = ()
     # answer_required の画面を、検出できないまま (answer_hold_sec の保持で) 入力した場合は、画面が途切れず動き続けて、
     # この秒数たってからでないとプレイ画面とみなさない。
     # メニューが開閉する遷移 (暗転など) は、判定が PLAYING で、画面も大きく動くが、0.5 秒ほどで止まるため、
@@ -87,6 +91,8 @@ def default_flow_config() -> FlowConfig:
     押さないよう、3秒待ってから押す。
     """
     return FlowConfig(answer_required=(Screen.GAME_OVER,), play_confirm_sec=1.5,
+                      answer_cancel_screens=(Screen.TITLE, Screen.TITLE_GAME_START, Screen.MODE_SELECT, Screen.RANK_SELECT,
+                                             Screen.PLAYER_SELECT, Screen.PLAYER_SELECT_MISMATCH, Screen.RESUME_DIALOG),
                       settle_by_screen={Screen.TITLE: 3.0}, max_presses_by_screen={Screen.STUCK: 6, Screen.TITLE: 10},
                       keys={
         Screen.TITLE: (SCAN_DOWN,),
@@ -198,6 +204,8 @@ class GameFlow:
                     if now - seen_at <= cfg.answer_hold_sec:
                         screen = required
                         break
+            elif detected in cfg.answer_cancel_screens:
+                awaiting.clear()
             if screen in (Screen.PLAYING, Screen.UNKNOWN) and still_for >= cfg.still_sec:
                 screen = Screen.STUCK
             if screen is current:

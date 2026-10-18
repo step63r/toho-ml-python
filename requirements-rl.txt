@@ -1,2 +1,6 @@
 -r requirements.txt
+# torch は CUDA 版を、先に次のコマンドで入れる (PyPI の torch は CPU 版になるため):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+# 動作確認した組み合わせ: torch 2.14.1+cu130 / stable-baselines3 2.9.0 / tensorboard 2.21.0
 stable-baselines3>=2.3
+tensorboard>=2.16
