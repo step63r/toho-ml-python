@@ -19,7 +19,7 @@ DQN で「東方紺珠伝」を学習する (実機のゲームにキー入力�
 出力 (--out_dir):
     train.log   ログ (再開しても追記)
     checkpoints/dqn_<ステップ数>_steps.zip   定期保存 (モデルのみ)
-    interrupted.zip と interrupted_replay_buffer.pkl   中断・異常終了のとき (再開用。リプレイバッファも保存する)
+    interrupted.zip と interrupted_replay_buffer/   中断・異常終了のとき (再開用。リプレイバッファは、埋まっている分を配列ごとの .npy で保存する)
     final.zip   目標のステップ数まで終わったとき
     monitor_<時刻>.monitor.csv   エピソードごとの 報酬 r (縮める前) / ステップ数 l / 経過秒 t
     tb/run_<時刻>/   tensorboard と progress.csv (SB3 の進捗の表と同じ値。tensorboard --logdir train_out)
@@ -29,17 +29,21 @@ import io
 import json
 import logging
 import os
+import shutil
 import time
 
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import gymnasium as gym
+import numpy as np
 
 from stable_baselines3 import DQN
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.logger import CSVOutputFormat, HumanOutputFormat, Logger, TensorBoardOutputFormat
+from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.type_aliases import TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecFrameStack
 
 from environment.wrappers import ChannelLast, ScaledReward
@@ -52,6 +56,8 @@ LOG_FILE_NAME = "train.log"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 # 再開時にリプレイバッファが無い場合に、バッファが貯まるまで学習を始めない steps 数
 RESUME_WARMUP_STEPS = 5000
+# リプレイバッファの保存対象 (ReplayBuffer の配列)
+BUFFER_ARRAYS = ("observations", "actions", "rewards", "dones", "timeouts")
 
 
 class LogStream(io.TextIOBase):
@@ -154,33 +160,102 @@ def build_model(venv: VecEnv, out_dir: Path, params: Dict[str, Any]) -> DQN:
     return model
 
 
-def save_state(model: DQN, out_dir: Path, name: str) -> Path:
+def save_replay_buffer(buffer: ReplayBuffer, directory: Path) -> None:
     """
-    モデルとリプレイバッファを保存する。書き込み途中で止まっても、前回の保存を壊さないよう、
-    別名に書いてから置き換える (リプレイバッファは数 GB あり、書き込みに時間がかかる)
+    リプレイバッファを、埋まっている分だけ、配列ごとの .npy にして保存する
+
+    SB3 の save_replay_buffer (pickle) は、確保した全体 (今の設定で約 4.3GB) を 1 ファイルに書く。
+    実機の学習の中断で、約 2.1GB まで書いたところで止まった (原因は未特定)。配列ごとに書けば、
+    埋まっている分だけで済む。別名のディレクトリに書き切ってから置き換えるので、途中で止まっても、前回の保存は壊れない。
+    """
+    directory = Path(directory)
+    partial = directory.with_name(directory.name + ".partial")
+    old = directory.with_name(directory.name + ".old")
+    shutil.rmtree(partial, ignore_errors=True)
+    partial.mkdir(parents=True)
+    size = buffer.size()
+    for name in BUFFER_ARRAYS:
+        np.save(partial / f"{name}.npy", getattr(buffer, name)[:size])
+    (partial / "meta.json").write_text(json.dumps(
+        {"pos": int(buffer.pos), "full": bool(buffer.full), "size": size, "buffer_size": int(buffer.buffer_size)}),
+        encoding="utf-8")
+    shutil.rmtree(old, ignore_errors=True)
+    if directory.exists():
+        os.replace(directory, old)
+    os.replace(partial, directory)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def load_replay_buffer(buffer: ReplayBuffer, directory: Path) -> int:
+    """save_replay_buffer で保存したバッファを、同じ大きさの buffer に読み込む。読み込んだ件数を返す"""
+    directory = Path(directory)
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    if meta["buffer_size"] != buffer.buffer_size:
+        raise ValueError(f"バッファの大きさが違います (保存 {meta['buffer_size']} / 現在 {buffer.buffer_size})。")
+    size = meta["size"]
+    for name in BUFFER_ARRAYS:
+        data = np.load(directory / f"{name}.npy", mmap_mode="r")      # 全体をメモリに二重に載せない
+        target = getattr(buffer, name)
+        if data.shape != (size,) + target.shape[1:]:
+            raise ValueError(f"{name} の形が違います (保存 {data.shape} / 現在 {target.shape})。"
+                             "--shrink_ratio や --n_stack が、保存したときと違う可能性があります。")
+        target[:size] = data
+    buffer.pos = int(meta["pos"])
+    buffer.full = bool(meta["full"])
+    return buffer.size()
+
+
+def save_state(model: DQN, out_dir: Path, name: str, announce: Callable[[str], None] = print) -> Path:
+    """
+    モデルとリプレイバッファを保存する。モデルを先に保存し、リプレイバッファが保存できなくても、モデルは残る。
+    どちらも別名に書いてから置き換える。リプレイバッファは数 GB あり、時間がかかるので、待つよう知らせる
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model_path = out_dir / f"{name}.zip"
-    buffer_path = out_dir / f"{name}_replay_buffer.pkl"
     model.save(out_dir / f"{name}.partial.zip")
     os.replace(out_dir / f"{name}.partial.zip", model_path)
-    model.save_replay_buffer(out_dir / f"{name}_replay_buffer.partial.pkl")
-    os.replace(out_dir / f"{name}_replay_buffer.partial.pkl", buffer_path)
-    logger.info("保存しました: %s (ステップ数 %d)", model_path, model.num_timesteps)
+    logger.info("モデルを保存しました: %s (ステップ数 %d)", model_path, model.num_timesteps)
+
+    buffer = model.replay_buffer
+    gigabytes = sum(getattr(buffer, n)[:buffer.size()].nbytes for n in BUFFER_ARRAYS) / 1e9
+    announce(f"モデルを保存しました。リプレイバッファ (約 {gigabytes:.1f} GB) を保存しています。"
+             "完了するまで、もう一度 Ctrl+C を押さないでください。")
+    try:
+        save_replay_buffer(buffer, out_dir / f"{name}_replay_buffer")
+    except Exception:
+        logger.exception("リプレイバッファを保存できませんでした。モデルだけを保存しました。")
+        announce("リプレイバッファを保存できませんでした (モデルは保存済み)。再開すると、バッファが貯まるまで学習を始めません。")
+        return model_path
+    logger.info("リプレイバッファを保存しました: %s", out_dir / f"{name}_replay_buffer")
     return model_path
 
 
-def load_for_resume(path: Path, venv: VecEnv, out_dir: Path, device: str = "auto") -> DQN:
-    """保存したモデルを読み込む。リプレイバッファが隣にあれば読み込み、無ければ貯まるまで学習を始めない"""
+def load_for_resume(path: Path, venv: VecEnv, out_dir: Path, device: str = "auto",
+                    train_freq: Optional[int] = None, gradient_steps: Optional[int] = None) -> DQN:
+    """
+    保存したモデルを読み込む。リプレイバッファが隣にあれば読み込み、無ければ貯まるまで学習を始めない
+
+    train_freq と gradient_steps を渡すと、保存したモデルの値を上書きする (再開では、保存した値が使われるため)。
+    """
     path = Path(path)
     model = DQN.load(path, env=venv, device=device)
     model.verbose = 0                                # 保存したときの値 (1) だと、ターミナルに出力してしまう
     model.set_logger(make_sb3_logger(out_dir))
-    buffer_path = path.with_name(path.stem + "_replay_buffer.pkl")
-    if buffer_path.exists():
-        model.load_replay_buffer(buffer_path)
-        logger.info("リプレイバッファを読み込みました: %s (%d 件)", buffer_path, model.replay_buffer.size())
+    if train_freq is not None:
+        model.train_freq = TrainFreq(int(train_freq), TrainFrequencyUnit.STEP)
+    if gradient_steps is not None:
+        model.gradient_steps = int(gradient_steps)
+    logger.info("学習の設定: %d ステップごとに、勾配更新を %d 回", model.train_freq.frequency, model.gradient_steps)
+
+    buffer_dir = path.with_name(path.stem + "_replay_buffer")
+    legacy_path = path.with_name(path.stem + "_replay_buffer.pkl")
+    if (buffer_dir / "meta.json").exists():
+        count = load_replay_buffer(model.replay_buffer, buffer_dir)
+        logger.info("リプレイバッファを読み込みました: %s (%d 件)", buffer_dir, count)
+    elif legacy_path.exists():
+        model.load_replay_buffer(legacy_path)
+        logger.info("リプレイバッファを読み込みました: %s (%d 件)", legacy_path, model.replay_buffer.size())
     else:
         model.learning_starts = model.num_timesteps + RESUME_WARMUP_STEPS
         logger.warning("リプレイバッファが無いので、%d ステップ貯まるまで学習を始めません (ステップ数 %d から)。",
@@ -229,7 +304,9 @@ def train(model: DQN, out_dir: Path, total_steps: int, checkpoint_every: int) ->
 def model_params(args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "learning_rate": args.learning_rate, "buffer_size": args.buffer_size, "learning_starts": args.learning_starts,
-        "batch_size": args.batch_size, "gamma": args.gamma, "train_freq": args.train_freq,
+        "batch_size": args.batch_size, "gamma": args.gamma,
+        "train_freq": 4 if args.train_freq is None else args.train_freq,
+        "gradient_steps": 1 if args.gradient_steps is None else args.gradient_steps,
         "target_update_interval": args.target_update_interval, "exploration_fraction": args.exploration_fraction,
         "exploration_final_eps": args.exploration_final_eps, "device": args.device, "seed": args.seed,
     }
@@ -278,7 +355,11 @@ def main() -> None:
     parser.add_argument("--learning_starts", type=int, default=10_000)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--train_freq", type=int, default=4)
+    parser.add_argument("--train_freq", type=int, default=None,
+                        help="何ステップごとに学習するか (既定 4)。再開で指定すると、保存した値を上書きする")
+    parser.add_argument("--gradient_steps", type=int, default=None,
+                        help="学習のたびの勾配更新の回数 (既定 1)。再開で指定すると、保存した値を上書きする。"
+                             "ゲームの 1 ステップは約 0.13 秒で、GPU の 1 回の更新は数 ms なので、増やしても速度はほとんど落ちない")
     parser.add_argument("--target_update_interval", type=int, default=2000)
     parser.add_argument("--exploration_fraction", type=float, default=0.3,
                         help="探索率を下げていく範囲 (全ステップに対する割合)")
@@ -304,7 +385,7 @@ def main() -> None:
 
     venv = build_vec_env(env_factory, args.out_dir, args.n_stack, args.reward_scale)
     if args.resume:
-        model = load_for_resume(args.resume, venv, args.out_dir, args.device)
+        model = load_for_resume(args.resume, venv, args.out_dir, args.device, args.train_freq, args.gradient_steps)
     else:
         model = build_model(venv, args.out_dir, model_params(args))
     print(f"=== 学習 (ゲームにキー入力を送ります。Ctrl+C または {args.out_dir / STOP_FILE_NAME} の作成で中断)")

@@ -1,3 +1,5 @@
+import json
+import shutil
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -92,7 +94,7 @@ def test_目標まで学習すると_定期保存と最終保存が残る(tmp_pa
 
     assert result == "final"
     assert model.num_timesteps >= 300
-    assert (tmp_path / "final.zip").exists() and (tmp_path / "final_replay_buffer.pkl").exists()
+    assert (tmp_path / "final.zip").exists() and (tmp_path / "final_replay_buffer" / "meta.json").exists()
     assert sorted(p.name for p in (tmp_path / "checkpoints").glob("dqn_*_steps.zip")) == [
         "dqn_100_steps.zip", "dqn_200_steps.zip", "dqn_300_steps.zip"]
     assert not list(tmp_path.glob("*.partial.*"))             # 書き込み用の一時ファイルが残らない
@@ -109,7 +111,7 @@ def test_STOPファイルで止めると_保存して中断として終わる(tm
 
     assert result == "interrupted"
     assert 120 <= model.num_timesteps < 200
-    assert (tmp_path / "interrupted.zip").exists() and (tmp_path / "interrupted_replay_buffer.pkl").exists()
+    assert (tmp_path / "interrupted.zip").exists() and (tmp_path / "interrupted_replay_buffer" / "meta.json").exists()
 
 
 def test_前回のSTOPファイルが残っていても_始めた直後に止まらない(tmp_path):
@@ -171,7 +173,7 @@ def test_中断したモデルから再開すると_ステップ数とバッフ�
 def test_リプレイバッファが無い再開では_貯まるまで学習を始めない(tmp_path):
     model, venv = make_model(tmp_path)
     train_dqn.train(model, tmp_path, total_steps=100, checkpoint_every=500)
-    (tmp_path / "final_replay_buffer.pkl").unlink()
+    shutil.rmtree(tmp_path / "final_replay_buffer")
     venv2 = train_dqn.build_vec_env(lambda: FakeGameEnv(), tmp_path, n_stack=4)
 
     resumed = train_dqn.load_for_resume(tmp_path / "final.zip", venv2, tmp_path, device="cpu")
@@ -286,3 +288,100 @@ def test_再開せずに保存のある出力先で始めると_上書きを避�
 def test_空の出力先なら最初から始められる(tmp_path):
     assert train_dqn.check_start_paths(tmp_path, None) is None
     assert train_dqn.check_start_paths(tmp_path / "new", None) is None
+
+
+def fill(model, steps: int) -> None:
+    """バッファに、中身の違う件数分のデータを入れる (学習はしない)"""
+    obs = np.zeros((1,) + SHAPE + (4,), dtype=np.uint8)
+    for i in range(steps):
+        model.replay_buffer.add(np.full_like(obs, i % 256).transpose(0, 3, 1, 2), np.full_like(obs, (i + 1) % 256).transpose(0, 3, 1, 2),
+                                np.array([i % 18]), np.array([float(i)]), np.array([False]), [{}])
+
+
+def test_リプレイバッファは埋まっている分だけ配列ごとに保存され_同じ内容に読み戻せる(tmp_path):
+    model, venv = make_model(tmp_path)
+    fill(model, 50)
+    buffer = model.replay_buffer
+
+    train_dqn.save_replay_buffer(buffer, tmp_path / "buf")
+    sizes = {p.name: p.stat().st_size for p in (tmp_path / "buf").glob("*.npy")}
+    model2, _ = make_model(tmp_path / "other")
+    count = train_dqn.load_replay_buffer(model2.replay_buffer, tmp_path / "buf")
+
+    assert count == 50 and model2.replay_buffer.pos == buffer.pos and not model2.replay_buffer.full
+    assert np.array_equal(model2.replay_buffer.observations[:50], buffer.observations[:50])
+    assert np.array_equal(model2.replay_buffer.actions[:50], buffer.actions[:50])
+    assert np.array_equal(model2.replay_buffer.rewards[:50], buffer.rewards[:50])
+    # 確保した全体 (300 件) ではなく、埋まっている 50 件だけを書く
+    assert sizes["observations.npy"] < 50 * 112 * 96 * 4 * 1.1 and sizes["observations.npy"] > 50 * 112 * 96 * 4
+
+
+def test_リプレイバッファの保存が途中で失敗しても_前回の保存は壊れない(tmp_path, monkeypatch):
+    model, venv = make_model(tmp_path)
+    fill(model, 20)
+    train_dqn.save_replay_buffer(model.replay_buffer, tmp_path / "buf")
+    fill(model, 10)
+    real_save = np.save
+    calls = []
+
+    def failing_save(path, array, *args, **kwargs):
+        calls.append(path)
+        if len(calls) == 3:
+            raise OSError("ディスクが一杯")
+        return real_save(path, array, *args, **kwargs)
+
+    monkeypatch.setattr(train_dqn.np, "save", failing_save)
+    with pytest.raises(OSError):
+        train_dqn.save_replay_buffer(model.replay_buffer, tmp_path / "buf")
+
+    assert json.loads((tmp_path / "buf" / "meta.json").read_text(encoding="utf-8"))["size"] == 20
+
+
+def test_リプレイバッファを保存できなくても_モデルは保存され_中断として終わる(tmp_path, monkeypatch):
+    def on_step(n: int) -> None:
+        if n == 120:
+            raise KeyboardInterrupt
+
+    model, venv = make_model(tmp_path, on_step)
+    monkeypatch.setattr(train_dqn, "save_replay_buffer", lambda buffer, directory: (_ for _ in ()).throw(OSError("失敗")))
+
+    result = train_dqn.train(model, tmp_path, total_steps=1000, checkpoint_every=500)
+
+    assert result == "interrupted"
+    assert (tmp_path / "interrupted.zip").exists()
+    assert not (tmp_path / "interrupted_replay_buffer").exists()
+
+
+def test_保存中は待つよう知らせる(tmp_path):
+    model, venv = make_model(tmp_path)
+    fill(model, 5)
+    messages = []
+
+    train_dqn.save_state(model, tmp_path, "x", announce=messages.append)
+
+    assert any("Ctrl+C を押さないでください" in m for m in messages)
+
+
+def test_形の違うバッファは読み込まずに説明つきで失敗する(tmp_path):
+    model, venv = make_model(tmp_path)
+    fill(model, 5)
+    train_dqn.save_replay_buffer(model.replay_buffer, tmp_path / "buf")
+    meta_path = tmp_path / "buf" / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["buffer_size"] = 999
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="バッファの大きさ"):
+        train_dqn.load_replay_buffer(model.replay_buffer, tmp_path / "buf")
+
+
+def test_再開で学習の頻度と更新回数を上書きできる(tmp_path):
+    model, venv = make_model(tmp_path)
+    train_dqn.train(model, tmp_path, total_steps=60, checkpoint_every=500)
+    venv2 = train_dqn.build_vec_env(lambda: FakeGameEnv(), tmp_path, n_stack=4)
+
+    kept = train_dqn.load_for_resume(tmp_path / "final.zip", venv2, tmp_path, device="cpu")
+    changed = train_dqn.load_for_resume(tmp_path / "final.zip", venv2, tmp_path, device="cpu", train_freq=1, gradient_steps=2)
+
+    assert (kept.train_freq.frequency, kept.gradient_steps) == (4, 1)
+    assert (changed.train_freq.frequency, changed.gradient_steps) == (1, 2)
