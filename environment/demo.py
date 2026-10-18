@@ -243,6 +243,18 @@ def load_session(session_dir: Path, with_obs: bool = False) -> Dict[str, np.ndar
     return {name: np.concatenate([p[name] for p in parts]) for name in parts[0]}
 
 
+def playable_mask(session: Dict[str, np.ndarray], episodes: Optional[List[Dict[str, Any]]] = None) -> np.ndarray:
+    """
+    学習に使えるフレームの真偽値: エピソードの中 (終わりのフレームは、遷移の「次の画面」なので含めない) で、
+    行動が決まっていて、X (ボム。環境の行動に無い) が押されていないフレーム
+    """
+    episodes = find_episodes(session) if episodes is None else episodes
+    inside = np.zeros(len(session["screen"]), dtype=bool)
+    for episode in episodes:
+        inside[episode["start"]:episode["end"]] = True
+    return inside & (session["action"] >= 0) & ~session["x_pressed"].astype(bool)
+
+
 PLAY_SCREENS = frozenset({"playing", "chapter_finish", "spell_card_bonus", "stage_clear"})
 
 

@@ -269,8 +269,11 @@ def test_確認ツールは_エピソードと押したキーの偏りと注意�
     messages = inspect_demo.warnings(stats, 0.133)
 
     assert [(e["start"], e["end"], e["reason"]) for e in stats["episodes"]] == [(0, 10, "death"), (13, 17, "open")]
-    assert stats["playable_frames"] == 10 + 4                         # 終わりのフレーム (遷移の次の画面) は含めない
-    assert stats["actions"][3] == 6 and stats["x_pressed_frames"] == 2
+    # 終わりのフレーム (遷移の次の画面) と、X (ボム) を押した 2 フレームは、学習に使えるフレームに含めない
+    assert stats["playable_frames"] == 10 + 4 - 2
+    assert stats["x_pressed_frames"] == 2
+    # X を押した 2 フレーム (行動 12 と 0 の 1 つずつ) を除いた、残り 12 フレームの内訳
+    assert (stats["actions"][3], stats["actions"][12], stats["actions"][0]) == (6, 1, 1)
     assert stats["z_fraction"] == pytest.approx(0.3, abs=0.01)
     assert any("ボム" in m for m in messages) and any("Z (ショット)" in m for m in messages)
 

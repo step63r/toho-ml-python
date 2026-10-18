@@ -79,3 +79,72 @@ def test_秒数には_エピソード終了時の自動リセットの復旧時�
     report = evaluate_dqn.evaluate(venv, 2, lambda obs: 0, clock=lambda: state["now"])
 
     assert [e["seconds"] for e in report["episodes"]] == [pytest.approx(3.0)] * 2     # 30 ステップ × 0.1 秒
+
+
+def test_人のプレイの行動の割合を求める_ボムを押したフレームとプレイ中でないフレームは除く(tmp_path):
+    from environment.demo import DemoWriter
+    from tools.evaluate_dqn import action_prior
+    writer = DemoWriter(tmp_path, flush_every=50, background=False)
+    screens = ["title"] * 3 + ["playing"] * 8 + ["game_over"]
+    actions = [5] * 3 + [9, 9, 9, 0, 0, 12, 12, 12] + [3]
+    for k, (screen, action) in enumerate(zip(screens, actions)):
+        writer.add(np.zeros((8, 6), np.uint8), k * 0.133, screen, 0.0, False, 0, 0.5)
+        writer.set_action(action, 1.0, k == 10, False)                # 10 番目 (行動 12) だけ、X を押した
+    writer.close()
+
+    prior = action_prior([tmp_path])
+
+    assert prior.sum() == pytest.approx(1.0) and len(prior) == 18
+    assert prior[9] == pytest.approx(3 / 7) and prior[0] == pytest.approx(2 / 7) and prior[12] == pytest.approx(2 / 7)
+    assert prior[5] == 0 and prior[3] == 0
+
+
+def test_割合から選ぶ方策は_stickyの確率で前の行動を続ける():
+    from tools.evaluate_dqn import sampling_policy
+    prior = np.full(18, 1 / 18)
+
+    never = sampling_policy(prior, np.random.default_rng(0), sticky=0.0)
+    always = sampling_policy(prior, np.random.default_rng(0), sticky=1.0)
+    mostly = sampling_policy(prior, np.random.default_rng(0), sticky=0.9)
+
+    def changes(policy):
+        actions = [policy(None) for _ in range(2000)]
+        return sum(a != b for a, b in zip(actions, actions[1:])) / 1999
+
+    assert changes(always) == 0.0                                    # 最初に選んだ行動を、ずっと続ける
+    assert changes(never) > 0.9
+    assert 0.05 < changes(mostly) < 0.15                              # 続けない確率 0.1 × (別の行動になる確率 17/18)
+
+
+def test_割合どおりに選ぶと_選んだ行動の割合が近づく():
+    from tools.evaluate_dqn import sampling_policy
+    prior = np.zeros(18)
+    prior[9], prior[0] = 0.7, 0.3
+    policy = sampling_policy(prior, np.random.default_rng(1))
+
+    chosen = np.bincount([policy(None) for _ in range(4000)], minlength=18) / 4000
+
+    assert chosen[9] == pytest.approx(0.7, abs=0.03) and chosen[0] == pytest.approx(0.3, abs=0.03)
+    assert chosen.sum() == pytest.approx(chosen[9] + chosen[0])
+
+
+def test_死なないまま最大ステップに達したエピソードは_打ち切りとして記録して_次に進む(tmp_path, capsys):
+    class LongEnv(FakeGameEnv):
+        EPISODE_STEPS = 50                                          # 最大 20 ステップより長い
+
+    venv = train_dqn.build_vec_env(lambda: LongEnv(), tmp_path, n_stack=4)
+
+    report = evaluate_dqn.evaluate(venv, 4, lambda obs: 0, max_steps=20)
+
+    episodes = report["episodes"]
+    assert [e["censored"] for e in episodes] == [True, True, False, True]    # 20 + 20 + 10 (50 ステップ目で死亡) + 次の 20
+    assert [e["steps"] for e in episodes[:2]] == [20, 20] and report["censored"] == 3
+    assert episodes[2]["steps"] == 50                                # 死亡したエピソードは、全体のステップ数
+
+
+def test_最大ステップを指定しなければ_打ち切らない(tmp_path, capsys):
+    venv = make_venv(tmp_path)
+
+    report = evaluate_dqn.evaluate(venv, 2, lambda obs: 0)
+
+    assert report["censored"] == 0 and all(not e["censored"] for e in report["episodes"])

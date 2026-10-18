@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Sequence
 import numpy as np
 
 from environment.demo import (FLAG_CHAPTER_FINISH, FLAG_GAME_OVER, FLAG_LOST, FLAG_SPELL_CARD_BONUS, FLAG_STAGE_CLEAR, SCREEN_NAMES,
-                              find_episodes, iter_parts, load_session)
+                              find_episodes, iter_parts, load_session, playable_mask)
 from utils.native import COMMAND_DICT
 
 
@@ -30,11 +30,8 @@ def summarize(session: Dict[str, np.ndarray], period: float) -> Dict[str, Any]:
     t = session["t"]
     intervals = np.diff(t) if len(t) > 1 else np.array([])
     episodes = find_episodes(session)
-    in_episode = np.zeros(len(t), dtype=bool)
-    for e in episodes:
-        in_episode[e["start"]:e["end"]] = True                       # 終わりのフレームは、遷移の「次の画面」なので含めない
     actions = session["action"]
-    playable = in_episode & (actions >= 0)
+    playable = playable_mask(session, episodes)
     counts = Counter(actions[playable].tolist())
     flags = session["flags"]
     screens = Counter(SCREEN_NAMES[i] for i in session["screen"])
@@ -50,7 +47,7 @@ def summarize(session: Dict[str, np.ndarray], period: float) -> Dict[str, Any]:
         "actions": counts,
         "idle_share": counts.get(0, 0) / max(sum(counts.values()), 1),
         "z_fraction": float(session["z_fraction"][playable].astype(np.float32).mean()) if playable.any() else 0.0,
-        "x_pressed_frames": int(session["x_pressed"][playable].sum()) if playable.any() else 0,
+        "x_pressed_frames": int(session["x_pressed"][session["action"] >= 0].sum()),
         "esc_pressed_frames": int(session["esc_pressed"].sum()),
         "chapter_finish": int(((flags & FLAG_CHAPTER_FINISH) > 0).sum()),
         "spell_card_bonus": int(((flags & FLAG_SPELL_CARD_BONUS) > 0).sum()),
@@ -72,8 +69,8 @@ def warnings(stats: Dict[str, Any], period: float) -> List[str]:
         found.append(f"Z (ショット) を押していた割合が {stats['z_fraction']:.0%} と低い。ショットを押しっぱなしにして遊んでいるか確認する。")
     if stats["playable_frames"] and stats["idle_share"] > 0.6:
         found.append(f"何も押していない (または方向を押していない) フレームが {stats['idle_share']:.0%}。キーが読めていない可能性がある。")
-    if stats["lost_frames"] > 20:
-        found.append(f"静止で「迷子」と判定されたフレームが {stats['lost_frames']} 件 (ポーズの時間など)。そのフレームは、エピソードに含めない扱いになる。")
+    if stats["lost_frames"] > 200:
+        found.append(f"静止で「迷子」と判定されたフレームが {stats['lost_frames']} 件 (メニュー・ポーズなど)。そのフレームは、エピソードに含めない扱いになる。")
     return found
 
 
