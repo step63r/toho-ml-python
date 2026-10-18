@@ -81,6 +81,7 @@ def run_bench(env: Kanjuden, episodes: int, max_episode_seconds: float, max_seco
     except KeyboardInterrupt:
         interrupted = True
         print("中断しました。ここまでの結果を保存します。")
+        env.dump_diagnostics("interrupted")
     finally:
         env.close()
     return summarize(results, timers.summary(), time.perf_counter() - started, interrupted)
@@ -116,12 +117,15 @@ def main() -> None:
     parser.add_argument("--max_episode_seconds", type=float, default=120.0, help="1エピソードの最大時間 (秒)")
     parser.add_argument("--max_seconds", type=float, default=900.0, help="全体の最大時間 (秒)")
     parser.add_argument("--out_dir", type=Path, default=Path("bench_out"))
+    parser.add_argument("--diagnostics_dir", type=Path, default=Path("diagnostics_out"),
+                        help="迷子・中断のときに、直近のフレームと判定・動き量を保存するディレクトリ")
     args = parser.parse_args()
 
     open_window(args)  # ログ設定とウィンドウの存在確認
     env = Kanjuden(app_class_name=args.app_class_name, app_window_name=args.app_window_name,
                    shrink_ratio=args.shrink_ratio, clip_top=args.clip_top, clip_bottom=args.clip_bottom,
-                   clip_left=args.clip_left, clip_right=args.clip_right)
+                   clip_left=args.clip_left, clip_right=args.clip_right,
+                   diagnostics_dir=str(args.diagnostics_dir))
     print("=== ランダム方策 (ゲームにキー入力を送ります。Ctrl+C で中断)")
     report = run_bench(env, args.episodes, args.max_episode_seconds, args.max_seconds)
 

@@ -4,18 +4,21 @@ import numpy as np
 import tkinter
 
 from gymnasium import spaces
+from pathlib import Path
 from PIL import Image, ImageTk
 from typing import Any, Dict, Optional, Tuple
 
 
 from environment.capture import DEFAULT_APP_CLASS_NAME, DEFAULT_APP_WINDOW_NAME, FrameSpec, GameWindow
+from environment.diagnostics import FrameRecorder
 from environment.flow import FlowConfig, GameFlow, default_flow_config
 from environment.screens import (
     POINT_P_TEMPLATE, POINT_TEN_TEMPLATE,
     STILL_DIFF, GameOverState, GameOverTracker, OnsetDetector, Screen, ScreenDetector, TemplateLibrary,
     frame_motion, playfield_signature)
 from utils import cv2helper
-from utils.native import COMMAND_DICT, SCAN_Z, SCAN_RIGHT, SCAN_LEFT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT, HoldKeys, ReleaseKey
+from utils.native import (
+    COMMAND_DICT, SCAN_Z, SCAN_RIGHT, SCAN_LEFT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT, HoldKeys, PressKey, ReleaseKey)
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,10 @@ OFF_PLAY_STEPS = 3
 # 画面が止まったまま (操作説明の詳細画面のように HUD が残る静止画面) になったとみなすステップ数。
 # 1ステップは約0.13秒なので、約2.7秒。ステージクリア等の動く画面は最小でも 6 の動きがあるため、誤検出しない
 LOST_STILL_STEPS = 20
+# Z (ショット) は押しっぱなしにして、この周期のうち 1 ステップだけ離す。
+# 毎ステップ押し直すと、死亡の瞬間の押し直しが攻略失敗メニューに決定として届き、ほぼ毎回「操作説明」などが選ばれる。
+# 押しっぱなしなら押し直しの辺がない。会話は Z を離して押し直さないと進まないので、周期的に離す
+FIRE_PERIOD_STEPS = 10
 
 
 class Kanjuden(gym.Env):
@@ -43,7 +50,7 @@ class Kanjuden(gym.Env):
     「東方紺珠伝」向けカスタムGymnasium環境
 
         - 目的：ゲームオーバーにならない
-        - 行動：(Z, 8方向, Shift) の組み合わせ
+        - 行動：(8方向 + 無し) × Shift の 18 通り。Z (ショット) は環境が管理する (FIRE_PERIOD_STEPS)
         - 状態：画面イメージ
         - 報酬：チャプタークリア・スペルカードボーナス・ステージクリア・アイテム取得で加点、ゲームオーバーで減点
         - エピソード完了：ゲームオーバーまたはステージクリア (次の reset() でプレイ画面まで進める)
@@ -54,6 +61,24 @@ class Kanjuden(gym.Env):
         """環境で使用し得る全てのキーを強制的に離す"""
         for key in {SCAN_Z, SCAN_LEFT, SCAN_RIGHT, SCAN_UP, SCAN_DOWN, SCAN_LSHIFT}:
             ReleaseKey(key)
+        self._fire_down = False
+        self._fire_phase = 0
+
+    def _send_action(self, action: Any) -> None:
+        """
+        行動のキーを送る
+
+        方向と Shift は、1 ステップだけ押して離す。Z は、押しっぱなしにして、周期の最後のステップだけ離す。
+        """
+        move_keys = [code for code in COMMAND_DICT.get(int(action), []) if code != SCAN_Z]
+        fire = self._fire_phase < self.fire_period_steps - 1
+        if fire and not self._fire_down:
+            PressKey(SCAN_Z)
+        elif not fire and self._fire_down:
+            ReleaseKey(SCAN_Z)
+        self._fire_down = fire
+        self._fire_phase = (self._fire_phase + 1) % self.fire_period_steps
+        HoldKeys(move_keys, self.action_hold_frames)
 
     def __init__(self,
                  app_class_name: str = DEFAULT_APP_CLASS_NAME,
@@ -65,8 +90,10 @@ class Kanjuden(gym.Env):
                  clip_left: int = 32,
                  clip_right: int = 416,
                  action_hold_frames: int = 4,
+                 fire_period_steps: int = FIRE_PERIOD_STEPS,
                  flow_config: Optional[FlowConfig] = None,
                  debug_dump_path: Optional[str] = None,
+                 diagnostics_dir: Optional[str] = None,
                  render_mode: Optional[str] = None) -> None:
         """
         初期化処理
@@ -91,10 +118,15 @@ class Kanjuden(gym.Env):
             画像を切り取る位置 (right), by default 416
         action_hold_frames : int, optional
             1ステップでキーを押し続けるフレーム数, by default 4
+        fire_period_steps : int, optional
+            Z (ショット) を、この周期のうち 1 ステップだけ離す。2 以上, by default 10
         flow_config : FlowConfig, optional
             画面遷移 (タイトル〜プレイ開始、ゲームオーバーからのリトライ) の設定, by default default_flow_config()
         debug_dump_path : str, optional
             指定すると毎ステップの観測画像をこのパスに書き出す, by default None
+        diagnostics_dir : str, optional
+            指定すると、直近のフレームと判定・動き量を溜めておき、迷子の検出やフローの失敗、
+            dump_diagnostics() の呼び出しのときにこのディレクトリに書き出す, by default None
         render_mode : str, optional
             "human" のみ対応, by default None
         """
@@ -102,6 +134,11 @@ class Kanjuden(gym.Env):
 
         self.use_rgb = use_rgb
         self.action_hold_frames = action_hold_frames
+        if fire_period_steps < 2:
+            raise ValueError("fire_period_steps は 2 以上にしてください (1 だと Z を一度も押さなくなります)。")
+        self.fire_period_steps = fire_period_steps
+        self._fire_down = False
+        self._fire_phase = 0
         self.debug_dump_path = debug_dump_path
         self.render_mode = render_mode
         self.current_screen: Optional[np.ndarray] = None
@@ -117,11 +154,14 @@ class Kanjuden(gym.Env):
         self._templates = TemplateLibrary()
         self._detector = ScreenDetector(self._templates)
         self._game_over = GameOverTracker()
+        self._flow_recorder = FrameRecorder(Path(diagnostics_dir)) if diagnostics_dir else None
+        self._step_recorder = FrameRecorder(Path(diagnostics_dir), capacity=60) if diagnostics_dir else None
         self._flow = GameFlow(
             grab_gray=lambda: self._window.grab()[1],
             press=lambda codes: HoldKeys(codes, 4),
             detector=self._detector,
-            config=flow_config or default_flow_config())
+            config=flow_config or default_flow_config(),
+            recorder=self._flow_recorder)
         self._chapter_finish = OnsetDetector()
         self._spell_card_bonus = OnsetDetector()
         self._stage_clear = OnsetDetector()
@@ -210,7 +250,7 @@ class Kanjuden(gym.Env):
         if self._game_over.state is GameOverState.SOFT:
             self._release_all_keys()
         else:
-            HoldKeys(COMMAND_DICT.get(int(action), []), self.action_hold_frames)
+            self._send_action(action)
 
         observation = self._grab()
         gray = self._gray
@@ -260,12 +300,18 @@ class Kanjuden(gym.Env):
         # 攻略失敗を見逃したまま、メニューなどの中に入ってしまった場合 (迷子)。エピソードを終え、
         # 次の reset() で遷移制御が Esc で戻す。入ってしまうのは死亡の直後なので、ゲームオーバーとして扱う
         signature = playfield_signature(gray)
-        if self._previous_signature is not None and frame_motion(self._previous_signature, signature) < STILL_DIFF:
+        motion = None if self._previous_signature is None else frame_motion(self._previous_signature, signature)
+        if motion is not None and motion < STILL_DIFF:
             self._still_steps += 1
         else:
             self._still_steps = 0
         self._previous_signature = signature
         self._off_play_steps = self._off_play_steps + 1 if detection.screen in OFF_PLAY_SCREENS else 0
+        if self._step_recorder:
+            self._step_recorder.record(
+                gray, action=int(action), screen=detection.screen.value, game_over_score=round(detection.game_over_score, 3),
+                motion=None if motion is None else round(motion, 3), still_steps=self._still_steps,
+                off_play_steps=self._off_play_steps)
         if (not terminated and detection.screen is not Screen.GAME_OVER
                 and (self._still_steps >= LOST_STILL_STEPS or self._off_play_steps >= OFF_PLAY_STEPS)):
             logger.warning("プレイ画面から外れました (画面=%s, 静止 %d ステップ)。エピソードを終了します。",
@@ -275,6 +321,7 @@ class Kanjuden(gym.Env):
             self._needs_advance = True
             self._still_steps = self._off_play_steps = 0
             events.extend(["game_over", "lost"])
+            self.dump_diagnostics("lost")
             info["lost"] = True
 
         info["events"] = events
@@ -284,6 +331,12 @@ class Kanjuden(gym.Env):
         info["input_allowed"] = state is GameOverState.NONE
 
         return observation, reward, terminated, False, info
+
+    def dump_diagnostics(self, reason: str) -> None:
+        """溜めてある直近のフレームを書き出す (diagnostics_dir を指定した場合のみ)"""
+        for recorder in (self._flow_recorder, self._step_recorder):
+            if recorder:
+                recorder.dump(f"{reason}_{'flow' if recorder is self._flow_recorder else 'step'}")
 
     def render(self) -> None:
         """環境の描画 (render_mode="human" のみ)"""

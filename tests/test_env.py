@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -48,6 +49,7 @@ def load_screen(screen: Screen) -> np.ndarray:
 class FakeWindow:
     """GameWindow の代わりに、実機で撮った各画面を状態に応じて返す"""
     instance: Optional["FakeWindow"] = None
+    key_events: List[Tuple[str, int]] = []
     initial_screen = Screen.PLAYING
 
     def __init__(self, app_class_name, app_window_name, spec) -> None:
@@ -130,17 +132,28 @@ class FakeWindow:
 def keys(monkeypatch) -> List[Tuple[int, ...]]:
     """キー入力を記録し、時間待ちを省く"""
     pressed: List[Tuple[int, ...]] = []
+    FakeWindow.key_events = []
 
     def hold_keys(codes, frames) -> None:
         pressed.append(tuple(codes))
         if FakeWindow.instance is not None:
             FakeWindow.instance.on_keys(codes)
 
+    def press_key(code) -> None:
+        # 押しっぱなしのキー (Z) の押し直し。ゲームには、押した瞬間だけキー入力として届く
+        FakeWindow.key_events.append(("down", code))
+        if FakeWindow.instance is not None:
+            FakeWindow.instance.on_keys((code,))
+
+    def release_key(code) -> None:
+        FakeWindow.key_events.append(("up", code))
+
     FakeWindow.initial_screen = Screen.PLAYING
     FakeWindow.instance = None
     monkeypatch.setattr(env_module, "GameWindow", FakeWindow)
     monkeypatch.setattr(env_module, "HoldKeys", hold_keys)
-    monkeypatch.setattr(env_module, "ReleaseKey", lambda code: None)
+    monkeypatch.setattr(env_module, "PressKey", press_key)
+    monkeypatch.setattr(env_module, "ReleaseKey", release_key)
     return pressed
 
 
@@ -434,3 +447,117 @@ def test_動くプレイ画面は_静止判定で終了しない(keys):
     results = [env.step(0) for _ in range(min(env_module.LOST_STILL_STEPS, 60) * 2)]
 
     assert not any(r[2] for r in results)
+
+
+def test_迷子で終了したときは_直近のステップの判定と動き量を保存する(keys, tmp_path):
+    env = make_env(diagnostics_dir=str(tmp_path))
+    env.reset()
+    FakeWindow.instance.show_manual_detail()
+
+    terminated, steps = False, 0
+    while not terminated and steps < min(env_module.LOST_STILL_STEPS, 60) + 5:
+        terminated = env.step(0)[2]
+        steps += 1
+
+    assert terminated is True
+    dumped = [d for d in tmp_path.iterdir() if d.name.endswith("lost_step")]
+    assert len(dumped) == 1
+    rows = json.loads((dumped[0] / "frames.json").read_text(encoding="utf-8"))
+    assert rows[-1]["still_steps"] >= env_module.LOST_STILL_STEPS
+    assert {"screen", "motion", "action", "file"} <= set(rows[0])
+
+
+def test_診断の保存先を指定しなければ_何も書かない(keys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    env = make_env()
+    env.reset()
+    FakeWindow.instance.show_manual_detail()
+    for _ in range(min(env_module.LOST_STILL_STEPS, 60) + 2):
+        env.step(0)
+    env.dump_diagnostics("manual")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def z_events() -> List[str]:
+    return [kind for kind, code in FakeWindow.key_events if code == SCAN_Z]
+
+
+def test_Zは押しっぱなしで_周期の最後の1ステップだけ離して押し直す(keys):
+    env = make_env(fire_period_steps=4)
+    env.reset()
+    FakeWindow.key_events.clear()
+
+    per_step = []
+    for _ in range(9):
+        before = len(z_events())
+        env.step(0)
+        per_step.append(z_events()[before:])
+
+    # 周期 4: 押す・保持・保持・離す、を繰り返す (会話は押し直しの辺がないと進まない)
+    assert per_step == [["down"], [], [], ["up"], ["down"], [], [], ["up"], ["down"]]
+
+
+def test_行動のキーにZは含まれず_方向とShiftだけ毎ステップ押して離す(keys):
+    env = make_env()
+    env.reset()
+    keys.clear()
+
+    for action in (0, 2, 10, 17):                  # 行動 2 = 上、10 = Shift + 左、17 = Shift + 下 + 左
+        env.step(action)
+
+    assert keys == [(), (env_module.SCAN_UP,), (env_module.SCAN_LSHIFT, env_module.SCAN_LEFT),
+                    (env_module.SCAN_LSHIFT, env_module.SCAN_DOWN, env_module.SCAN_LEFT)]
+
+
+def test_Zが押しっぱなしの間に死んでも_攻略失敗メニューは決定されず_Escで1回でリトライする(keys):
+    # 実機で、死亡のたびに「操作説明」などが選ばれていた状況 (毎ステップ Z を押し直していた) の再現。
+    # 押しっぱなしなら、死亡の瞬間に Z の押し直しの辺がないので、上キーでカーソルが動いても決定されない
+    env = make_env()
+    env.reset()
+    env.step(0)                                    # 最初のステップで Z を押す
+    FakeWindow.instance.leaked_cursor = 2
+    FakeWindow.instance.leak_selects = True
+    queue_game_over()
+
+    _, reward, terminated, _, _ = env.step(2)      # 行動 2 = 上
+
+    assert (reward, terminated) == (env_module.REWARD_GAME_OVER, True)
+    assert FakeWindow.instance.screen is Screen.GAME_OVER
+    keys.clear()
+    env.reset()
+    assert keys == [(SCAN_ESC,)]
+    assert FakeWindow.instance.screen is Screen.PLAYING
+
+
+def test_Zを押し直すステップで死ぬと_決定が届いて操作説明に入る(keys):
+    # 押し直しの辺が残る周期の先頭 (最初のステップ) では、まだ漏れる。周期を長くするほど確率が下がる (残る課題の記録)
+    env = make_env()
+    env.reset()
+    FakeWindow.instance.leaked_cursor = 2
+    FakeWindow.instance.leak_selects = True
+    queue_game_over()
+
+    env.step(2)
+
+    assert FakeWindow.instance.screen is Screen.MANUAL_MENU
+
+
+def test_resetでZを離し_次のステップで押し直す(keys):
+    env = make_env()
+    env.reset()
+    env.step(0)
+    env.step(0)
+    FakeWindow.key_events.clear()
+
+    env.reset()
+    assert ("up", SCAN_Z) in FakeWindow.key_events
+    FakeWindow.key_events.clear()
+    env.step(0)
+
+    assert z_events() == ["down"]
+
+
+def test_fire_period_stepsは2以上(keys):
+    with pytest.raises(ValueError, match="fire_period_steps"):
+        make_env(fire_period_steps=1)
