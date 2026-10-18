@@ -565,3 +565,14 @@ def test_answer_cancel_screensが空なら_選択画面の遷移を攻略失敗�
     make_flow(game, dict(config.keys), answer_required=config.answer_required).advance_to_playing()
 
     assert game.codes == [(SCAN_ESC,)]
+
+
+def test_リトライの遷移画面_Restartでは_何も押さずに終わるのを待つ():
+    # 実機: Esc で「今回を無かった事にする」を選んだ後に、約 0.4 秒出る。HUD が残るので、以前は PLAYING と取り違えて、早く抜けていた
+    config = default_flow_config()
+    game = ScriptedGame([(Screen.RESTART, True)] * 4 + [(Screen.PLAYING, True)] * 10)
+
+    make_flow(game, dict(config.keys), answer_required=config.answer_required).advance_to_playing()
+
+    assert game.codes == []
+    assert game.grabs >= 4 + 3                              # Restart の間は抜けず、PLAYING が 3 フレーム続いてから抜ける

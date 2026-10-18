@@ -148,3 +148,51 @@ def test_最大ステップを指定しなければ_打ち切らない(tmp_path,
     report = evaluate_dqn.evaluate(venv, 2, lambda obs: 0)
 
     assert report["censored"] == 0 and all(not e["censored"] for e in report["episodes"])
+
+
+def test_止まるを基本にした選び方は_余裕を超えて良い行動があるときだけ動く():
+    from tools.evaluate_dqn import choose_with_margin
+    q = np.zeros(18)
+    q[9], q[3] = 0.50, 0.58                                      # 行動 3 は、止まる (9) より 0.08 良い
+
+    assert choose_with_margin(q, 9, margin=0.05) == 3            # 余裕 0.05 を超える → 動く
+    assert choose_with_margin(q, 9, margin=0.10) == 9            # 余裕 0.10 を超えない → 止まる
+    assert choose_with_margin(q, 9, margin=0.0) == 3
+    q[3] = q[9]
+    assert choose_with_margin(q, 9, margin=0.0) == 9              # 同じ値なら、止まる
+
+
+def test_Q値の最大は_モデルの貪欲な行動と一致する(tmp_path):
+    from tools.evaluate_dqn import q_values
+    venv = make_venv(tmp_path)
+    model = train_dqn.build_model(venv, tmp_path, PARAMS)
+    eval_env = model.get_env()
+    obs = eval_env.reset()
+
+    q = q_values(model, obs)
+
+    assert q.shape == (18,)
+    assert int(np.argmax(q)) == int(model.predict(obs, deterministic=True)[0][0])
+
+
+def test_on_stepは_死なずに続いているステップだけ_何ステップ目かを渡して呼ばれる(tmp_path, capsys):
+    venv = make_venv(tmp_path)                                       # 30 ステップで死ぬ
+    seen = []
+
+    evaluate_dqn.evaluate(venv, 2, lambda obs: 0, on_step=seen.append)
+
+    assert seen == list(range(1, 30)) * 2                            # 死亡のステップ (30) では呼ばれない
+
+
+def test_診断のためのenv_methodが_ラッパー越しに呼べる(tmp_path):
+    class DumpEnv(FakeGameEnv):
+        dumped = []
+
+        def dump_diagnostics(self, reason):
+            DumpEnv.dumped.append(reason)
+
+    venv = train_dqn.build_vec_env(lambda: DumpEnv(), tmp_path, n_stack=4)
+
+    venv.env_method("dump_diagnostics", "eval_step100")
+
+    assert DumpEnv.dumped == ["eval_step100"]

@@ -57,6 +57,9 @@ class Screen(Enum):
     SPELL_CARD_BONUS = "spell_card_bonus"
     STAGE_CLEAR = "stage_clear"
     GAME_OVER = "game_over"
+    # 攻略失敗から「今回を無かった事にする」を選んだ後の、リトライの遷移画面 (暗い市松模様と、動く "Restart" の文字)。
+    # 自機エリアが市松模様になるが、右側の HUD は残る。並びを変えると、保存済みの記録 (environment.demo) が読めなくなるので、末尾に足した
+    RESTART = "restart"
 
 
 class GameOverState(Enum):
@@ -235,6 +238,28 @@ STILL_DIFF = 1.5
 SIGNATURE_SIZE = (96, 112)
 
 
+# リトライの遷移画面 (Restart) の判定。自機エリアが、動かない暗い市松模様 (点線の格子) になり、その上を "Restart" の文字が動く。
+# 文字の位置と大きさが変わっても、背景の格子が支配的なので、自機エリアの輝度の平均・標準偏差・エッジの強さ (ラプラシアンの絶対値の平均) が、
+# ほぼ一定になる。マスクの照合 (白い文字と暗い縁取り) は、文字が淡い灰色で動くので使えない。
+# 人のプレイの記録 (リトライ 3 回 = 9 フレーム) と、診断用の保存フレーム 1 万枚以上で、Restart は次の範囲に入り、
+# プレイ中の暗い画面 (平均 38〜56) は、標準偏差が 28〜33 以上で、離れていた (誤判定 0 件、無作為の 40 枚と 20 枚を目視で確認)。
+RESTART_STATS_FULL = {"mean": (43.0, 47.5), "std": (19.0, 27.0), "lap": (22.5, 32.0)}       # 自機エリア 384x450 (等倍)
+RESTART_STATS_QUARTER = {"mean": (43.0, 47.5), "std": (9.5, 20.0), "lap": (24.0, 40.0)}      # 0.25 倍 (112x96。保存したバッファの画像)
+
+
+def is_restart_playfield(playfield: np.ndarray, stats: Dict[str, Tuple[float, float]] = RESTART_STATS_FULL) -> bool:
+    """自機エリアのグレー画像が、リトライの遷移画面 (Restart) か。平均 → 標準偏差 → エッジの順に、安い指標から調べる"""
+    pixels = playfield.astype(np.float32)
+    low, high = stats["mean"]
+    if not low <= float(pixels.mean()) <= high:
+        return False
+    low, high = stats["std"]
+    if not low <= float(pixels.std()) <= high:
+        return False
+    low, high = stats["lap"]
+    return low <= float(np.abs(cv2.Laplacian(pixels, cv2.CV_32F)).mean()) <= high
+
+
 def playfield_signature(frame: np.ndarray) -> np.ndarray:
     """画面の動きを測るための、自機エリアの縮小画像 (縮小するのは、細かい雑音に反応しないため)"""
     x0, y0, x1, y1 = PLAYFIELD_RECT
@@ -284,6 +309,10 @@ class ScreenDetector:
         scores[GAME_OVER_RULE.screen.value] = game_over_score
         if game_over_score >= GAME_OVER_RULE.threshold:
             return Detection(Screen.GAME_OVER, game_over_score, scores)
+
+        # Restart は、HUD が残るので、PLAYING より先に判定する
+        if is_restart_playfield(self.playfield(frame)):
+            return Detection(Screen.RESTART, game_over_score, scores)
 
         overlays = set()
         for rule in OVERLAY_RULES:

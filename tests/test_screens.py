@@ -58,6 +58,12 @@ def load_screen(name: str) -> np.ndarray:
     ("loading_run", Screen.LOADING),
     # 会話中はプレイ画面と同じ HUD で、区別していない (会話中は決定キーを断続的に押す必要がある)
     ("dialogue_stage1", Screen.PLAYING),
+    # リトライの遷移画面。HUD が残るので、PLAYING より先に判定する。文字の位置・大きさが変わっても、背景の格子で判定できる
+    ("restart", Screen.RESTART),
+    ("restart_early", Screen.RESTART),
+    ("restart_late", Screen.RESTART),
+    ("restart_big_text", Screen.RESTART),
+    ("restart_small_text", Screen.RESTART),
     # 操作説明: サブメニューは HUD が残るのでマスクで区別する。詳細画面は 9 ページ分の文字が違うので区別せず、
     # HUD が残ったまま静止していること (動きのなさ) で検出する
     ("manual_menu", Screen.MANUAL_MENU),
@@ -254,3 +260,25 @@ def test_動きの測定_静止した画面とプレイ中の画面を分ける(
     assert frame_motion(still, still) == 0.0 < STILL_DIFF
     # 別のプレイ画面同士は、大きく違う (実機のプレイ中の連続フレームは、最小でも約 6 の差があった)
     assert frame_motion(play_a, play_b) > STILL_DIFF * 3
+
+
+def test_Restartの判定は_他のどの画面の撮影も取り違えない(detector):
+    # 26 枚の実機の撮影のうち、Restart 以外は、Restart と判定されない (プレイ中の暗い画面を含む)
+    for path in sorted((FIXTURES / "screens").glob("*.png")):
+        if path.stem.startswith("restart"):
+            continue
+        frame = cv2helper.imread(str(path), 0)
+        assert detector.detect(frame).screen is not Screen.RESTART, path.stem
+
+
+def test_Restartの判定は_0_25倍の画像でも_範囲を変えて使える():
+    import cv2
+    from environment.screens import RESTART_STATS_QUARTER, is_restart_playfield
+    x0, y0, x1, y1 = PLAYFIELD_RECT
+    for name in ("restart", "restart_early", "restart_late", "restart_big_text", "restart_small_text"):
+        frame = load_screen(name)[y0:y1, x0:x1]
+        small = cv2.resize(frame, (96, 112), interpolation=cv2.INTER_AREA)
+        assert is_restart_playfield(small, RESTART_STATS_QUARTER), name
+    for name in ("playing", "boss_battle", "stage2_play", "game_over"):
+        small = cv2.resize(load_screen(name)[y0:y1, x0:x1], (96, 112), interpolation=cv2.INTER_AREA)
+        assert not is_restart_playfield(small, RESTART_STATS_QUARTER), name

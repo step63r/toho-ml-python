@@ -139,3 +139,117 @@ def test_再開と新規のオプションの組み合わせを検査する(tmp_
     assert "新しく始めるときだけ" in train_dqn.check_new_run_options(args(resume=tmp_path / "x.zip", double=True))
     assert "--init_buffer が必要" in train_dqn.check_new_run_options(args(pretrain_updates=100))
     assert "見つかりません" in train_dqn.check_new_run_options(args(init_buffer=tmp_path / "none"))
+
+
+def test_探索の行動空間は_指定した割合と続ける確率で引く():
+    from tools.exploration import PriorDiscrete
+    prior = np.zeros(18)
+    prior[9], prior[0] = 0.7, 0.3
+
+    free = PriorDiscrete(prior, sticky=0.0, seed=0)
+    sticky = PriorDiscrete(prior, sticky=0.9, seed=0)
+    drawn = np.array([free.sample() for _ in range(4000)])
+    held = [int(sticky.sample()) for _ in range(4000)]
+
+    assert set(drawn.tolist()) == {0, 9} and (drawn == 9).mean() == pytest.approx(0.7, abs=0.03)
+    assert sum(a != b for a, b in zip(held, held[1:])) / 3999 < 0.15         # 0.1 × (別の行動になる確率 0.42)
+    assert isinstance(free.sample(), np.int64) and free.n == 18
+
+
+def test_探索の行動空間は_不正な割合を受け付けない():
+    from tools.exploration import PriorDiscrete
+    with pytest.raises(ValueError):
+        PriorDiscrete([0.0, 0.0])
+    with pytest.raises(ValueError):
+        PriorDiscrete([1.0, -0.5])
+    with pytest.raises(ValueError):
+        PriorDiscrete([1.0, 1.0], sticky=1.5)
+
+
+def test_探索のランダムな行動が_人の割合から選ばれ_保存と再開をまたいで差し替えを戻せる(tmp_path):
+    from tools.exploration import PriorDiscrete, set_exploration
+    prior = np.zeros(18)
+    prior[9] = 1.0                                              # 人は、常に行動 9 (止まる) を押す、という極端な割合
+    model, venv = make_double(tmp_path, n_steps=3)
+    model.exploration_initial_eps = 1.0
+    set_exploration(model, PriorDiscrete(prior, sticky=0.5, seed=0))
+
+    train_dqn.train(model, tmp_path, total_steps=100, checkpoint_every=1000)
+
+    stored = model.replay_buffer.actions[:model.replay_buffer.size()].reshape(-1)
+    # 探索率が高い最初の 10 ステップは、人の割合 (行動 9 だけ) から選ばれる。探索率が下がった後は、方策 (貪欲な行動) になる
+    assert (stored[:10] == 9).mean() >= 0.9
+    venv2 = train_dqn.build_vec_env(lambda: FakeGameEnv(), tmp_path, n_stack=4)
+    resumed = train_dqn.load_for_resume(tmp_path / "final.zip", venv2, tmp_path, device="cpu")
+    assert isinstance(resumed.action_space, PriorDiscrete)      # 差し替えは、保存に含まれる
+    set_exploration(resumed, None)
+    assert not isinstance(resumed.action_space, PriorDiscrete) and resumed.action_space.n == 18
+
+
+def real_small_frame(name):
+    """実機の撮影 (640x480) の自機エリアを、環境の観測と同じ 0.25 倍 (112x96) にしたもの"""
+    import cv2
+    from pathlib import Path
+    from environment.screens import PLAYFIELD_RECT
+    from utils import cv2helper
+    gray = cv2helper.imread(str(Path(__file__).parent / "fixtures" / "screens" / f"{name}.png"), 0)
+    x0, y0, x1, y1 = PLAYFIELD_RECT
+    return cv2.resize(gray[y0:y1, x0:x1], (96, 112), interpolation=cv2.INTER_AREA)
+
+
+def stack_of(frame):
+    return np.broadcast_to(frame, (1, 4) + frame.shape).copy()
+
+
+def chain(model, frames, last_done=True):
+    """frames を順に、遷移 (frames[i] → frames[i+1]) としてバッファに追加する。報酬は 0、最後の遷移だけ done"""
+    for i in range(len(frames) - 1):
+        done = last_done and i == len(frames) - 2
+        model.replay_buffer.add(stack_of(frames[i]), stack_of(frames[i + 1]), np.array([[i % 18]]), np.array([0.0]),
+                                np.array([done]), [{}])
+
+
+def test_見落とした死亡を直して取り込む_Restartの直前を死亡にし_Restartの観測から始まる遷移は捨てる(tmp_path):
+    play, boss, restart = real_small_frame("playing"), real_small_frame("boss_battle"), real_small_frame("restart")
+    frames = [play, boss, play, boss, play] + [restart] * 3 + [boss, play, boss, play, boss]
+    old, venv = make_double(tmp_path / "old", n_steps=1, double=False)
+    chain(old, frames)
+    train_dqn.save_replay_buffer(old.replay_buffer, tmp_path / "buf")
+    new, venv2 = make_double(tmp_path / "new", n_steps=3)
+
+    count = train_dqn.import_transitions(new.replay_buffer, tmp_path / "buf")
+
+    # 12 遷移のうち、Restart の観測から始まる 3 件を捨てる。play → Restart の遷移は、死亡 (done、報酬 -1) に直す
+    assert count == 9 and new.replay_buffer.size() == 9
+    dones = new.replay_buffer.dones[:9].reshape(-1)
+    rewards = new.replay_buffer.rewards[:9].reshape(-1)
+    assert dones.tolist() == [False, False, False, False, True, False, False, False, True]      # 4 番目 (直した死亡) と、最後 (元の done)
+    assert rewards[4] == pytest.approx(-1.0) and rewards[[0, 1, 2, 3, 5, 6, 7, 8]].tolist() == [0.0] * 8
+    assert np.array_equal(new.replay_buffer.next_observations[4][0, -1], restart)               # 死亡の遷移の次の観測は Restart
+
+
+def test_repairを切ると_そのまま取り込む(tmp_path):
+    play, restart = real_small_frame("playing"), real_small_frame("restart")
+    old, venv = make_double(tmp_path / "old", n_steps=1, double=False)
+    chain(old, [play, play, restart, restart, play])
+    train_dqn.save_replay_buffer(old.replay_buffer, tmp_path / "buf")
+    new, venv2 = make_double(tmp_path / "new", n_steps=3)
+
+    count = train_dqn.import_transitions(new.replay_buffer, tmp_path / "buf", repair=False)
+
+    assert count == 4 and not new.replay_buffer.dones[:4].reshape(-1)[:3].any()
+
+
+def test_次の観測を持つバッファ_n_step_からも取り込め_見落としを直せる(tmp_path):
+    play, restart = real_small_frame("playing"), real_small_frame("restart")
+    old, venv = make_double(tmp_path / "old", n_steps=3)               # next_observations.npy を持つ
+    chain(old, [play, play, restart, restart, restart, play, play])
+    train_dqn.save_replay_buffer(old.replay_buffer, tmp_path / "buf")
+    assert (tmp_path / "buf" / "next_observations.npy").exists()
+    new, venv2 = make_double(tmp_path / "new", n_steps=3)
+
+    count = train_dqn.import_transitions(new.replay_buffer, tmp_path / "buf")
+
+    # 6 遷移: play→play、play→Restart (直して死亡)、Restart から始まる 3 件は捨てる、最後の play→play
+    assert count == 3
+    assert new.replay_buffer.dones[:3].reshape(-1).tolist() == [False, True, True]       # 2 番目: 直した死亡、3 番目: 元の done

@@ -349,6 +349,18 @@ class Kanjuden(gym.Env):
             events.append("game_over")
             info["game_over_confidence"] = detection.game_over_score
 
+        # 攻略失敗のメニューを検出する前に、Z の押し直しがメニューを決定すると、メニューがほとんど見えないまま、
+        # リトライの遷移画面 (Restart) になる (メニューが出始めてから 1 ステップ以内に消える)。Z を押しっぱなしにする設計で、
+        # 保存したバッファの約 10% の死亡が、この形で見落とされていた。Restart は、リトライのたびに必ず現れるので、
+        # 見落とした死亡として扱う。死亡した瞬間の数ステップ後になるが、被弾の演出 (リング) が映る状態が、終了の直前に並ぶ
+        if detection.screen is Screen.RESTART and not terminated:
+            reward = REWARD_GAME_OVER
+            terminated = True
+            self._needs_advance = True
+            events.extend(["game_over", "missed_game_over"])
+            info["missed_game_over"] = True
+            logger.warning("攻略失敗を検出できないまま、リトライの遷移画面 (Restart) になりました。死亡として扱います。")
+
         # 攻略失敗を見逃したまま、メニューなどの中に入ってしまった場合 (迷子)。エピソードを終え、
         # 次の reset() で遷移制御が Esc で戻す。入ってしまうのは死亡の直後なので、ゲームオーバーとして扱う
         signature = playfield_signature(gray)

@@ -29,7 +29,8 @@ from tools.train_dqn import build_vec_env
 
 
 def evaluate(venv: VecEnv, episodes: int, policy: Callable[[np.ndarray], int],
-             clock: Callable[[], float] = time.perf_counter, max_steps: Optional[int] = None) -> Dict[str, Any]:
+             clock: Callable[[], float] = time.perf_counter, max_steps: Optional[int] = None,
+             on_step: Optional[Callable[[int], None]] = None) -> Dict[str, Any]:
     """
     policy (観測 → 行動) で、episodes 回のエピソードを動かす
 
@@ -40,6 +41,8 @@ def evaluate(venv: VecEnv, episodes: int, policy: Callable[[np.ndarray], int],
     max_steps を指定すると、死なないまま max_steps に達したエピソードは、打ち切り (censored) として記録して、
     ゲームはそのまま続け、次のエピソードの数え直しにする (止まり続ける方策などで、エピソードが終わらないのを避ける)。
     打ち切りのステップ数は「max_steps 以上」の意味なので、平均や中央値は、実際より低く出る。
+
+    on_step: 毎ステップの後に、そのエピソードの何ステップ目かを渡して呼ぶ (診断用の保存のきっかけなどに使う)。
     """
     results: List[Dict[str, Any]] = []
     actions: Counter = Counter()
@@ -55,6 +58,8 @@ def evaluate(venv: VecEnv, episodes: int, policy: Callable[[np.ndarray], int],
             obs, _, dones, infos = venv.step(np.array([action]))
             elapsed = clock() - started
             steps += 1
+            if on_step and not dones[0]:
+                on_step(steps)
             events.extend(infos[0].get("events", []))
             censored = not dones[0] and max_steps is not None and steps >= max_steps
             if not dones[0]:
@@ -106,6 +111,24 @@ def action_prior(session_dirs: Sequence[Path], actions: int = 18) -> np.ndarray:
     return counts / counts.sum()
 
 
+def q_values(model: DQN, obs: np.ndarray) -> np.ndarray:
+    """観測 1 件 (環境の数 1) の、18 通りの行動の Q 値。argmax は、model.predict(deterministic=True) と同じ"""
+    import torch
+    tensor, _ = model.policy.obs_to_tensor(obs)
+    with torch.no_grad():
+        return model.policy.q_net(tensor)[0].cpu().numpy()
+
+
+def choose_with_margin(q: np.ndarray, still_action: int, margin: float) -> int:
+    """
+    止まる行動 (still_action) を基本にして、Q 値が止まるより margin 以上良い行動があるときだけ、その行動を選ぶ
+
+    Q 値の行動間の差が、ノイズかもしれないときの保守的な選び方。margin=0 なら、通常の貪欲な行動 (同じ値なら止まる)。
+    """
+    best = int(np.argmax(q))
+    return best if q[best] - q[still_action] > margin else still_action
+
+
 def sampling_policy(probabilities: np.ndarray, rng: np.random.Generator, sticky: float = 0.0) -> Callable[[np.ndarray], int]:
     """
     行動の割合 probabilities から選ぶ方策。sticky の確率で、前の行動を続ける (人は、キーを押しっぱなしにするので、
@@ -133,10 +156,18 @@ def main() -> None:
                         help="常に同じ行動を選ぶ方策 (比較の基準)。9 = Shift のみ (止まる)、0 = 何も押さない (Z は環境が管理)")
     parser.add_argument("--human_prior", type=Path, nargs="+", default=None, metavar="SESSION",
                         help="人のプレイの記録での行動の割合から選ぶ方策 (比較の基準)")
+    parser.add_argument("--still_margin", type=float, default=None,
+                        help="--model で、止まる行動 (--still_action) を基本にして、Q 値が止まるより、この値より大きく良い行動があるときだけ動く。"
+                             "大きくするほど、止まる方策に近づく。省略すると、通常の貪欲な行動")
+    parser.add_argument("--still_action", type=int, default=9, choices=range(18), metavar="0..17", help="--still_margin の、止まる行動")
     parser.add_argument("--sticky", type=float, default=0.0,
                         help="--random / --human_prior で、前の行動を続ける確率 (人の押しっぱなしに近づける)")
     parser.add_argument("--epsilon", type=float, default=0.0, help="学習した方策にランダムな行動を混ぜる割合")
     parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--dump_at_step", type=int, default=None,
+                        help="エピソードが死亡で終わらないまま、このステップ数に達したら、直前の 60 ステップ分の画面と判定を、"
+                             "--diagnostics_dir に保存する (攻略失敗を見落としたまま続いている場面を調べるため。止まる方策なら 100 など)")
+    parser.add_argument("--diagnostics_dir", type=Path, default=Path("diagnostics_out") / "eval")
     parser.add_argument("--max_steps", type=int, default=800,
                         help="死なないまま、このステップ数 (800 = 約 107 秒) に達したエピソードは、打ち切りとして次に進む")
     parser.add_argument("--n_stack", type=int, default=4)
@@ -158,7 +189,8 @@ def main() -> None:
     def env_factory():
         return Kanjuden(app_class_name=args.app_class_name, app_window_name=args.app_window_name,
                         shrink_ratio=args.shrink_ratio, clip_top=args.clip_top, clip_bottom=args.clip_bottom,
-                        clip_left=args.clip_left, clip_right=args.clip_right, step_period_sec=args.step_period_sec)
+                        clip_left=args.clip_left, clip_right=args.clip_right, step_period_sec=args.step_period_sec,
+                        diagnostics_dir=str(args.diagnostics_dir) if args.dump_at_step else None)
 
     venv = build_vec_env(env_factory, args.out_dir, args.n_stack)
     rng = np.random.default_rng()
@@ -171,8 +203,12 @@ def main() -> None:
         def policy(obs: np.ndarray) -> int:
             if rng.random() < args.epsilon:
                 return int(rng.integers(venv.action_space.n))
+            if args.still_margin is not None:
+                return choose_with_margin(q_values(model, obs), args.still_action, args.still_margin)
             return int(model.predict(obs, deterministic=True)[0][0])
-        label, name = f"{args.model} (ステップ数 {model.num_timesteps}, ε={args.epsilon})", args.model.stem
+        margin = "" if args.still_margin is None else f", 止まる基本 (行動 {args.still_action}) + 余裕 {args.still_margin}"
+        label = f"{args.model} (ステップ数 {model.num_timesteps}, ε={args.epsilon}{margin})"
+        name = args.model.stem + ("" if args.still_margin is None else f"_margin{args.still_margin}")
     elif args.constant_action is not None:
         policy = lambda obs: args.constant_action
         label, name = f"常に行動 {args.constant_action}", f"constant{args.constant_action}"
@@ -184,8 +220,14 @@ def main() -> None:
         policy = sampling_policy(np.full(venv.action_space.n, 1 / venv.action_space.n), rng, args.sticky)
         label, name = f"ランダム方策 (sticky={args.sticky})", "random" if args.sticky == 0 else f"random_sticky{args.sticky}"
     print(f"=== 評価: {label} (ゲームにキー入力を送ります。Ctrl+C で中断)")
+
+    def dump_if_needed(steps: int) -> None:
+        if args.dump_at_step and steps == args.dump_at_step:
+            venv.env_method("dump_diagnostics", f"eval_step{steps}")
+            print(f"  (診断用の画面を保存しました: {args.diagnostics_dir})")
+
     try:
-        report = evaluate(venv, args.episodes, policy, max_steps=args.max_steps)
+        report = evaluate(venv, args.episodes, policy, max_steps=args.max_steps, on_step=dump_if_needed)
     finally:
         venv.close()                                 # 押しっぱなしのキーを離す
 

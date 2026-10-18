@@ -24,6 +24,7 @@ SCREEN_FIXTURES = {
     Screen.PLAYING: "playing",
     Screen.GAME_OVER: "game_over",
     Screen.MANUAL_MENU: "manual_menu",
+    Screen.RESTART: "restart",
 }
 
 # 決定キー (Z) を押したときの画面遷移
@@ -90,6 +91,10 @@ class FakeWindow:
         if self.screen is Screen.LOADING:
             self.loading_grabs += 1
             if self.loading_grabs > 4:
+                self.show(Screen.PLAYING)
+        if self.screen is Screen.RESTART:                    # リトライの遷移画面は、短い時間で終わる
+            self.loading_grabs += 1
+            if self.loading_grabs > 3:
                 self.show(Screen.PLAYING)
         gray = self.gray
         self.grabs += 1
@@ -676,3 +681,40 @@ def test_auto_advanceを切ると_初期化でメニューを進めず_キーを
     assert FakeWindow.instance.screen is Screen.TITLE_GAME_START
     assert (reward, terminated) == (0, False) and info["screen"] == "title_game_start"
     assert env.observation_space.contains(observation)
+
+
+def test_攻略失敗を検出できないままリトライの遷移画面になったら_見落とした死亡として終了する(keys):
+    env = make_env()
+    env.reset()
+    env.step(0)
+    FakeWindow.instance.show(Screen.RESTART)            # メニューが見えないまま、Z の押し直しで決定された
+
+    _, reward, terminated, _, info = env.step(0)
+
+    assert (reward, terminated) == (env_module.REWARD_GAME_OVER, True)
+    assert info["missed_game_over"] is True and info["events"] == ["game_over", "missed_game_over"]
+    assert info["screen"] == "restart"
+
+
+def test_見落とした死亡の後の_resetは_遷移画面が終わるのを待つだけで_キーを押さない(keys):
+    env = make_env()
+    env.reset()
+    FakeWindow.instance.show(Screen.RESTART)
+    env.step(0)
+    keys.clear()
+
+    observation, _ = env.reset()
+
+    assert keys == []                                    # Restart は自然に終わる。決定キーも Esc も押さない
+    assert FakeWindow.instance.screen is Screen.PLAYING
+    assert env.observation_space.contains(observation)
+
+
+def test_攻略失敗を検出できた通常の死亡は_見落とし扱いにならない(keys):
+    env = make_env()
+    env.reset()
+    queue_game_over()
+
+    _, reward, terminated, _, info = env.step(0)
+
+    assert terminated is True and "missed_game_over" not in info and info["events"] == ["game_over"]

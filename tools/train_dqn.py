@@ -49,6 +49,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecFrameStack
 
 from environment.wrappers import ChannelLast, ScaledReward
 from tools.double_dqn import DoubleDQN
+from tools.exploration import human_prior_space, set_exploration
 
 
 logger = logging.getLogger(__name__)
@@ -175,23 +176,50 @@ def saved_is_double(path: Path) -> bool:
         return bool(json.loads(archive.read("data").decode("utf-8")).get("double", False))
 
 
-def import_transitions(buffer: ReplayBuffer, directory: Path) -> int:
+def import_transitions(buffer: ReplayBuffer, directory: Path, repair: bool = True, death_reward: float = -1.0) -> int:
     """
-    save_replay_buffer で保存した、メモリ節約モードのバッファから、遷移を順に取り込む (今ある経験を、新しい設定の学習で再利用する)
+    save_replay_buffer で保存したバッファから、遷移を順に取り込む (今ある経験を、新しい設定の学習で再利用する)
 
-    メモリ節約モードは、次の観測を持たず、次の添字の観測で代用している。終わりの遷移 (死亡) の次の観測は、次のエピソードの最初のもの
-    だが、done で打ち切られるので、使われない。末尾が done でない遷移は、次の観測が無いので、捨てる。
+    メモリ節約モードのバッファは、次の観測を持たず、次の添字の観測で代用している (next_observations.npy があれば、それを使う)。
+    終わりの遷移 (死亡) の次の観測は、次のエピソードの最初のものだが、done で打ち切られるので、使われない。
+    末尾が done でない遷移は、次の観測が無いので、捨てる。
+
+    repair=True (既定) では、攻略失敗の見落としを直す。見落としは、攻略失敗のメニューを検出する前に、Z の押し直しがメニューを決定して、
+    リトライの遷移画面 (Restart) になる形で起き、保存したバッファの約 10% の死亡が、終了も報酬 (-1) も付かないまま、次のエピソードに
+    つながっていた。次の観測が Restart になる遷移を、死亡 (done=True、報酬 death_reward) に直し、Restart の観測から始まる遷移は捨てる
+    (環境は、Restart が終わってから、エピソードを始めるため)。画像は 0.25 倍 (112x96) の前提で判定する。
     """
+    from environment.screens import RESTART_STATS_QUARTER, is_restart_playfield
+
     directory = Path(directory)
     meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
     size = meta["size"]
     observations = np.load(directory / "observations.npy", mmap_mode="r")
+    next_file = directory / "next_observations.npy"
+    next_observations = np.load(next_file, mmap_mode="r") if next_file.exists() else None
     actions, rewards, dones = (np.load(directory / f"{n}.npy") for n in ("actions", "rewards", "dones"))
     last = size if bool(dones[size - 1].any()) else size - 1
+
+    def newest_frame(observation: np.ndarray) -> np.ndarray:
+        return np.asarray(observation).reshape(-1, *observation.shape[-2:])[-1]       # チャンネルの最後 = 最新のフレーム
+
+    imported = repaired = dropped = 0
     for i in range(last):
-        next_index = i + 1 if i + 1 < size else i
-        buffer.add(np.array(observations[i]), np.array(observations[next_index]), actions[i], rewards[i], dones[i], [{}])
-    return last
+        observation = np.array(observations[i])
+        next_observation = np.array(next_observations[i] if next_observations is not None
+                                    else observations[i + 1 if i + 1 < size else i])
+        reward, done = rewards[i], dones[i]
+        if repair:
+            if is_restart_playfield(newest_frame(observation), RESTART_STATS_QUARTER):
+                dropped += 1
+                continue
+            if not bool(np.asarray(done).any()) and is_restart_playfield(newest_frame(next_observation), RESTART_STATS_QUARTER):
+                reward, done = np.full_like(reward, death_reward), np.ones_like(done)
+                repaired += 1
+        buffer.add(observation, next_observation, actions[i], reward, done, [{}])
+        imported += 1
+    logger.info("取り込み: %d 件 (見落とした死亡を直した %d 件、Restart の観測から始まるため捨てた %d 件)", imported, repaired, dropped)
+    return imported
 
 
 def pretrain(model: DQN, updates: int, batch_size: int, chunk: int = 1000) -> None:
@@ -435,6 +463,11 @@ def main() -> None:
     parser.add_argument("--exploration_initial_eps", type=float, default=1.0,
                         help="探索率の初期値。事前学習した場合は、1.0 より下げてよい")
     parser.add_argument("--exploration_final_eps", type=float, default=0.05)
+    parser.add_argument("--explore_prior", type=Path, nargs="+", default=None, metavar="SESSION",
+                        help="探索のランダムな行動を、人のプレイの記録 (tools.record_demo) の行動の割合から選ぶ。"
+                             "指定しなければ、一様ランダム。再開のたびに指定すること (指定しないと、一様ランダムに戻る)")
+    parser.add_argument("--explore_sticky", type=float, default=0.8,
+                        help="--explore_prior で、前の行動を続ける確率 (人は、キーを押しっぱなしにする)")
     parser.add_argument("--double", action="store_true",
                         help="Double DQN にする (新しく始めるときだけ。再開では、保存したモデルに従う)")
     parser.add_argument("--n_steps", type=int, default=1,
@@ -476,6 +509,10 @@ def main() -> None:
             if args.pretrain_updates:
                 pretrain(model, args.pretrain_updates, args.batch_size)
                 print(f"    事前学習 {args.pretrain_updates} 回を行いました。")
+    set_exploration(model, human_prior_space(args.explore_prior, args.explore_sticky, args.seed) if args.explore_prior else None)
+    if args.explore_prior:
+        logger.info("探索は、人のプレイの記録 %s の行動の割合 (sticky=%.2f) から選びます。", [str(p) for p in args.explore_prior], args.explore_sticky)
+        print(f"    探索: 人のプレイの記録の行動の割合から選ぶ (前の行動を続ける確率 {args.explore_sticky})")
     print(f"=== 学習 (ゲームにキー入力を送ります。Ctrl+C または {args.out_dir / STOP_FILE_NAME} の作成で中断)")
     print(f"    現在 {model.num_timesteps} / 目標 {args.total_steps} ステップ。device={model.device}")
     print(f"    ログ: {log_path}")
