@@ -63,12 +63,15 @@ class Kanjuden(gym.Env):
             ReleaseKey(key)
         self._fire_down = False
         self._fire_phase = 0
+        self._held_moves = set()
 
     def _send_action(self, action: Any) -> None:
         """
         行動のキーを送る
 
-        方向と Shift は、1 ステップだけ押して離す。Z は、押しっぱなしにして、周期の最後のステップだけ離す。
+        Z は、押しっぱなしにして、周期の最後のステップだけ離す。
+        方向と Shift は、既定では 1 ステップだけ押して離す (action_hold_frames)。step_period_sec を指定した場合は、
+        次のステップまで押しっぱなしにして、行動が変わったキーだけを押し直す (人の操作と同じ動き)。
         """
         move_keys = [code for code in COMMAND_DICT.get(int(action), []) if code != SCAN_Z]
         fire = self._fire_phase < self.fire_period_steps - 1
@@ -78,7 +81,23 @@ class Kanjuden(gym.Env):
             ReleaseKey(SCAN_Z)
         self._fire_down = fire
         self._fire_phase = (self._fire_phase + 1) % self.fire_period_steps
-        HoldKeys(move_keys, self.action_hold_frames)
+        if self.step_period_sec is None:
+            HoldKeys(move_keys, self.action_hold_frames)
+            return
+        wanted = set(move_keys)
+        for code in self._held_moves - wanted:
+            ReleaseKey(code)
+        for code in wanted - self._held_moves:
+            PressKey(code)
+        self._held_moves = wanted
+
+    def _wait_for_next_capture(self) -> None:
+        """前の撮影から step_period_sec たつまで待ってから撮る (キーを押したままの時間を、毎ステップ同じにする)"""
+        if self._last_capture_at is not None:
+            remaining = self._last_capture_at + self.step_period_sec - self._clock()
+            if remaining > 0:
+                self._sleep(remaining)
+        self._last_capture_at = self._clock()
 
     def __init__(self,
                  app_class_name: str = DEFAULT_APP_CLASS_NAME,
@@ -91,10 +110,13 @@ class Kanjuden(gym.Env):
                  clip_right: int = 416,
                  action_hold_frames: int = 4,
                  fire_period_steps: int = FIRE_PERIOD_STEPS,
+                 step_period_sec: Optional[float] = None,
                  flow_config: Optional[FlowConfig] = None,
                  debug_dump_path: Optional[str] = None,
                  diagnostics_dir: Optional[str] = None,
-                 render_mode: Optional[str] = None) -> None:
+                 render_mode: Optional[str] = None,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
         """
         初期化処理
 
@@ -120,6 +142,10 @@ class Kanjuden(gym.Env):
             1ステップでキーを押し続けるフレーム数, by default 4
         fire_period_steps : int, optional
             Z (ショット) を、この周期のうち 1 ステップだけ離す。2 以上, by default 10
+        step_period_sec : float, optional
+            指定すると、1 ステップを固定の長さ (撮影の間隔) にして、方向・Shift を次のステップまで押しっぱなしにする。
+            人のプレイの記録 (tools.record_demo) と同じ動きになる。省略すると、方向・Shift は毎ステップ
+            action_hold_frames だけ押して離す, by default None
         flow_config : FlowConfig, optional
             画面遷移 (タイトル〜プレイ開始、ゲームオーバーからのリトライ) の設定, by default default_flow_config()
         debug_dump_path : str, optional
@@ -137,8 +163,15 @@ class Kanjuden(gym.Env):
         if fire_period_steps < 2:
             raise ValueError("fire_period_steps は 2 以上にしてください (1 だと Z を一度も押さなくなります)。")
         self.fire_period_steps = fire_period_steps
+        if step_period_sec is not None and step_period_sec <= 0:
+            raise ValueError("step_period_sec は正の値にしてください。")
+        self.step_period_sec = step_period_sec
+        self._clock = clock
+        self._sleep = sleep
+        self._last_capture_at: Optional[float] = None
         self._fire_down = False
         self._fire_phase = 0
+        self._held_moves: set = set()
         self.debug_dump_path = debug_dump_path
         self.render_mode = render_mode
         self.current_screen: Optional[np.ndarray] = None
@@ -245,13 +278,23 @@ class Kanjuden(gym.Env):
         Tuple[numpy.ndarray, float, bool, bool, Dict[str, Any]]
             観測画像, 報酬, terminated, truncated, info
         """
-        info: Dict[str, Any] = {}
         # ゲームオーバーのフェードイン中に入力すると、メニュー操作の取りこぼしや誤入力になる
         if self._game_over.state is GameOverState.SOFT:
             self._release_all_keys()
         else:
             self._send_action(action)
+        if self.step_period_sec is not None:
+            self._wait_for_next_capture()
+        return self.observe(action)
 
+    def observe(self, action: Optional[Any] = None) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """
+        キーを送らずに、今の画面から観測・報酬・終了を求める (step() の、キー入力を除いた後半)
+
+        人のプレイの記録 (tools.record_demo) が、学習と同じ報酬・終了の判定を使うためのもの。
+        action は、診断用の記録に残すだけ (省略可)。
+        """
+        info: Dict[str, Any] = {}
         observation = self._grab()
         gray = self._gray
         detection = self._detector.detect(gray)

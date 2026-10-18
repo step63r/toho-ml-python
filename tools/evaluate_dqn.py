@@ -33,29 +33,34 @@ def evaluate(venv: VecEnv, episodes: int, policy: Callable[[np.ndarray], int],
     policy (観測 → 行動) で、episodes 回のエピソードを動かす
 
     VecEnv は、エピソードが終わると自動でリセットする (遷移制御による復旧で、時間がかかる)。
-    秒数は、ステップの時間だけを足し合わせる (復旧の時間を含めない)。KeyboardInterrupt では、そこまでの結果を返す。
+    終わったステップの時間には、その復旧が含まれるので、足さない。代わりに、そのエピソードの他のステップの
+    平均を 1 ステップ分足す。KeyboardInterrupt では、そこまでの結果を返す。
     """
     results: List[Dict[str, Any]] = []
     actions: Counter = Counter()
     interrupted = False
     obs = venv.reset()
-    steps, seconds, events = 0, 0.0, []
+    step_seconds: List[float] = []
+    steps, events = 0, []
     try:
         while len(results) < episodes:
             action = int(policy(obs))
             actions[action] += 1
             started = clock()
             obs, _, dones, infos = venv.step(np.array([action]))
-            seconds += clock() - started
+            elapsed = clock() - started
             steps += 1
             events.extend(infos[0].get("events", []))
-            if dones[0]:
-                episode = infos[0].get("episode", {})
-                results.append({"steps": int(episode.get("l", steps)), "seconds": seconds,
-                                "reward": float(episode.get("r", 0.0)), "events": events})
-                print(f"  episode {len(results) - 1}: {results[-1]['steps']:4d} steps  {seconds:5.1f}s  "
-                      f"reward={results[-1]['reward']:g} events={events}")
-                steps, seconds, events = 0, 0.0, []
+            if not dones[0]:
+                step_seconds.append(elapsed)
+                continue
+            seconds = sum(step_seconds) + (statistics.fmean(step_seconds) if step_seconds else 0.0)
+            episode = infos[0].get("episode", {})
+            results.append({"steps": int(episode.get("l", steps)), "seconds": seconds,
+                            "reward": float(episode.get("r", 0.0)), "events": events})
+            print(f"  episode {len(results) - 1}: {results[-1]['steps']:4d} steps  {seconds:5.1f}s  "
+                  f"reward={results[-1]['reward']:g} events={events}")
+            step_seconds, steps, events = [], 0, []
     except KeyboardInterrupt:
         interrupted = True
         print("中断しました。ここまでの結果を保存します。")

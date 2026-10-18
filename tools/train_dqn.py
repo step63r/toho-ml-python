@@ -31,6 +31,7 @@ import logging
 import os
 import shutil
 import time
+import zipfile
 
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -47,6 +48,7 @@ from stable_baselines3.common.type_aliases import TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecFrameStack
 
 from environment.wrappers import ChannelLast, ScaledReward
+from tools.double_dqn import DoubleDQN
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,11 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 RESUME_WARMUP_STEPS = 5000
 # リプレイバッファの保存対象 (ReplayBuffer の配列)
 BUFFER_ARRAYS = ("observations", "actions", "rewards", "dones", "timeouts")
+
+
+def buffer_array_names(buffer: ReplayBuffer) -> tuple:
+    """保存・読み込みする配列の名前。メモリ節約モードでないバッファ (n ステップ) は、次の観測も別に持つ"""
+    return BUFFER_ARRAYS + (("next_observations",) if getattr(buffer, "next_observations", None) is not None else ())
 
 
 class LogStream(io.TextIOBase):
@@ -151,13 +158,56 @@ def build_vec_env(env_factory: Callable[[], gym.Env], out_dir: Path, n_stack: in
     return VecFrameStack(DummyVecEnv([make]), n_stack=n_stack, channels_order="last")
 
 
-def build_model(venv: VecEnv, out_dir: Path, params: Dict[str, Any]) -> DQN:
+def build_model(venv: VecEnv, out_dir: Path, params: Dict[str, Any], double: bool = False) -> DQN:
     # optimize_memory_usage: 次の観測を別に持たず、メモリを約半分にする (画像のバッファは大きいため)。
-    # 時間切れの打ち切りを区別する仕組みと両立しないが、この環境は死亡かステージクリアでしか終わらないので問題ない
-    model = DQN("CnnPolicy", venv, verbose=0, optimize_memory_usage=True,
-                replay_buffer_kwargs={"handle_timeout_termination": False}, **params)
+    # 時間切れの打ち切りを区別する仕組みと両立しないが、この環境は死亡かステージクリアでしか終わらないので問題ない。
+    # n ステップ (n_steps > 1) のバッファは、このモードに対応していないので、次の観測も別に持つ (メモリは約 2 倍)
+    algorithm = DoubleDQN if double else DQN
+    model = algorithm("CnnPolicy", venv, verbose=0, optimize_memory_usage=params.get("n_steps", 1) == 1,
+                      replay_buffer_kwargs={"handle_timeout_termination": False}, **params)
     model.set_logger(make_sb3_logger(out_dir))
     return model
+
+
+def saved_is_double(path: Path) -> bool:
+    """保存したモデル (.zip) が DoubleDQN かどうか (DQN.load で読むと、目標値の計算が元の DQN に戻ってしまうため、読む前に調べる)"""
+    with zipfile.ZipFile(path) as archive:
+        return bool(json.loads(archive.read("data").decode("utf-8")).get("double", False))
+
+
+def import_transitions(buffer: ReplayBuffer, directory: Path) -> int:
+    """
+    save_replay_buffer で保存した、メモリ節約モードのバッファから、遷移を順に取り込む (今ある経験を、新しい設定の学習で再利用する)
+
+    メモリ節約モードは、次の観測を持たず、次の添字の観測で代用している。終わりの遷移 (死亡) の次の観測は、次のエピソードの最初のもの
+    だが、done で打ち切られるので、使われない。末尾が done でない遷移は、次の観測が無いので、捨てる。
+    """
+    directory = Path(directory)
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    size = meta["size"]
+    observations = np.load(directory / "observations.npy", mmap_mode="r")
+    actions, rewards, dones = (np.load(directory / f"{n}.npy") for n in ("actions", "rewards", "dones"))
+    last = size if bool(dones[size - 1].any()) else size - 1
+    for i in range(last):
+        next_index = i + 1 if i + 1 < size else i
+        buffer.add(np.array(observations[i]), np.array(observations[next_index]), actions[i], rewards[i], dones[i], [{}])
+    return last
+
+
+def pretrain(model: DQN, updates: int, batch_size: int, chunk: int = 1000) -> None:
+    """
+    環境を動かさずに、リプレイバッファだけで、更新を行う
+
+    SB3 は、目標ネットワークを環境のステップごとに同期するので、ここでは chunk 回ごとに自分で同期する。
+    固定データでの比較では、更新 4,000〜8,000 回付近が、未使用データでの相関のピークで、それ以上は下がった (過学習)。
+    """
+    done = 0
+    while done < updates:
+        count = min(chunk, updates - done)
+        model.train(gradient_steps=count, batch_size=batch_size)
+        model.q_net_target.load_state_dict(model.q_net.state_dict())
+        done += count
+        logger.info("事前学習: %d / %d 回 (loss %.5f)", done, updates, model.logger.name_to_value.get("train/loss", float("nan")))
 
 
 def save_replay_buffer(buffer: ReplayBuffer, directory: Path) -> None:
@@ -174,7 +224,7 @@ def save_replay_buffer(buffer: ReplayBuffer, directory: Path) -> None:
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(parents=True)
     size = buffer.size()
-    for name in BUFFER_ARRAYS:
+    for name in buffer_array_names(buffer):
         np.save(partial / f"{name}.npy", getattr(buffer, name)[:size])
     (partial / "meta.json").write_text(json.dumps(
         {"pos": int(buffer.pos), "full": bool(buffer.full), "size": size, "buffer_size": int(buffer.buffer_size)}),
@@ -193,7 +243,7 @@ def load_replay_buffer(buffer: ReplayBuffer, directory: Path) -> int:
     if meta["buffer_size"] != buffer.buffer_size:
         raise ValueError(f"バッファの大きさが違います (保存 {meta['buffer_size']} / 現在 {buffer.buffer_size})。")
     size = meta["size"]
-    for name in BUFFER_ARRAYS:
+    for name in buffer_array_names(buffer):
         data = np.load(directory / f"{name}.npy", mmap_mode="r")      # 全体をメモリに二重に載せない
         target = getattr(buffer, name)
         if data.shape != (size,) + target.shape[1:]:
@@ -218,7 +268,7 @@ def save_state(model: DQN, out_dir: Path, name: str, announce: Callable[[str], N
     logger.info("モデルを保存しました: %s (ステップ数 %d)", model_path, model.num_timesteps)
 
     buffer = model.replay_buffer
-    gigabytes = sum(getattr(buffer, n)[:buffer.size()].nbytes for n in BUFFER_ARRAYS) / 1e9
+    gigabytes = sum(getattr(buffer, n)[:buffer.size()].nbytes for n in buffer_array_names(buffer)) / 1e9
     announce(f"モデルを保存しました。リプレイバッファ (約 {gigabytes:.1f} GB) を保存しています。"
              "完了するまで、もう一度 Ctrl+C を押さないでください。")
     try:
@@ -239,7 +289,8 @@ def load_for_resume(path: Path, venv: VecEnv, out_dir: Path, device: str = "auto
     train_freq と gradient_steps を渡すと、保存したモデルの値を上書きする (再開では、保存した値が使われるため)。
     """
     path = Path(path)
-    model = DQN.load(path, env=venv, device=device)
+    algorithm = DoubleDQN if saved_is_double(path) else DQN
+    model = algorithm.load(path, env=venv, device=device)
     model.verbose = 0                                # 保存したときの値 (1) だと、ターミナルに出力してしまう
     model.set_logger(make_sb3_logger(out_dir))
     if train_freq is not None:
@@ -308,7 +359,9 @@ def model_params(args: argparse.Namespace) -> Dict[str, Any]:
         "train_freq": 4 if args.train_freq is None else args.train_freq,
         "gradient_steps": 1 if args.gradient_steps is None else args.gradient_steps,
         "target_update_interval": args.target_update_interval, "exploration_fraction": args.exploration_fraction,
+        "exploration_initial_eps": args.exploration_initial_eps,
         "exploration_final_eps": args.exploration_final_eps, "device": args.device, "seed": args.seed,
+        "n_steps": args.n_steps,
     }
 
 
@@ -333,6 +386,18 @@ def check_start_paths(out_dir: Path, resume: Optional[Path]) -> Optional[str]:
         return (f"{out_dir} には、すでに保存があります ({', '.join(existing)})。\n"
                 f"続きから学習するなら --resume {out_dir / existing[0]} を付けてください。"
                 "最初からやり直すなら、--out_dir を変えるか、保存を別の場所に移してください (上書きを避けるため、始めません)。")
+    return None
+
+
+def check_new_run_options(args: argparse.Namespace) -> Optional[str]:
+    """新しく始めるときだけ指定できるオプションの検査。問題があれば、そのメッセージを返す"""
+    if args.resume and (args.init_buffer or args.pretrain_updates or args.double or args.n_steps != 1):
+        return ("--double / --n_steps / --init_buffer / --pretrain_updates は、新しく始めるときだけ指定できます "
+                "(再開では、保存したモデルに従います)。")
+    if args.pretrain_updates and not args.init_buffer:
+        return "--pretrain_updates には、--init_buffer が必要です。"
+    if args.init_buffer and not (Path(args.init_buffer) / "meta.json").is_file():
+        return f"--init_buffer のバッファが見つかりません: {args.init_buffer} (meta.json がありません)。"
     return None
 
 
@@ -363,12 +428,23 @@ def main() -> None:
     parser.add_argument("--target_update_interval", type=int, default=2000)
     parser.add_argument("--exploration_fraction", type=float, default=0.3,
                         help="探索率を下げていく範囲 (全ステップに対する割合)")
+    parser.add_argument("--exploration_initial_eps", type=float, default=1.0,
+                        help="探索率の初期値。事前学習した場合は、1.0 より下げてよい")
     parser.add_argument("--exploration_final_eps", type=float, default=0.05)
+    parser.add_argument("--double", action="store_true",
+                        help="Double DQN にする (新しく始めるときだけ。再開では、保存したモデルに従う)")
+    parser.add_argument("--n_steps", type=int, default=1,
+                        help="n ステップのリターンを使う (既定 1)。2 以上では、メモリ節約モードが使えず、バッファのメモリは約 2 倍")
+    parser.add_argument("--init_buffer", type=Path, default=None,
+                        help="保存済みのリプレイバッファ (<name>_replay_buffer のディレクトリ) から、遷移を取り込んで始める (新しく始めるときだけ)")
+    parser.add_argument("--pretrain_updates", type=int, default=0,
+                        help="取り込んだバッファだけで、環境を動かす前に行う更新の回数 (--init_buffer が必要)。"
+                             "固定データでの比較では、4,000〜8,000 回付近が最良で、それ以上は過学習で下がった")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    problem = check_start_paths(args.out_dir, args.resume)
+    problem = check_start_paths(args.out_dir, args.resume) or check_new_run_options(args)
     if problem:
         parser.error(problem)                        # ゲームにキーを送る前に終わる
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -387,7 +463,15 @@ def main() -> None:
     if args.resume:
         model = load_for_resume(args.resume, venv, args.out_dir, args.device, args.train_freq, args.gradient_steps)
     else:
-        model = build_model(venv, args.out_dir, model_params(args))
+        model = build_model(venv, args.out_dir, model_params(args), double=args.double)
+        if args.init_buffer:
+            count = import_transitions(model.replay_buffer, args.init_buffer)
+            model.learning_starts = 0                # バッファに経験があるので、最初から学習してよい
+            logger.info("リプレイバッファに、%s から %d 件を取り込みました。", args.init_buffer, count)
+            print(f"    リプレイバッファに {count} 件を取り込みました。")
+            if args.pretrain_updates:
+                pretrain(model, args.pretrain_updates, args.batch_size)
+                print(f"    事前学習 {args.pretrain_updates} 回を行いました。")
     print(f"=== 学習 (ゲームにキー入力を送ります。Ctrl+C または {args.out_dir / STOP_FILE_NAME} の作成で中断)")
     print(f"    現在 {model.num_timesteps} / 目標 {args.total_steps} ステップ。device={model.device}")
     print(f"    ログ: {log_path}")

@@ -60,3 +60,22 @@ def test_イベントはエピソードごとに集計される(tmp_path, capsys
 
     assert report["event_counts"] == {"chapter_finish": 2}
     assert [e["events"] for e in report["episodes"]] == [["chapter_finish"]] * 2
+
+
+def test_秒数には_エピソード終了時の自動リセットの復旧時間を含めない(tmp_path, capsys):
+    state = {"now": 0.0}
+
+    class SlowResetEnv(FakeGameEnv):
+        def reset(self, *, seed=None, options=None):
+            state["now"] += 5.0                      # 遷移制御による復旧の時間
+            return super().reset(seed=seed, options=options)
+
+        def step(self, action):
+            state["now"] += 0.1                      # 1 ステップの時間
+            return super().step(action)
+
+    venv = train_dqn.build_vec_env(lambda: SlowResetEnv(), tmp_path, n_stack=4)
+
+    report = evaluate_dqn.evaluate(venv, 2, lambda obs: 0, clock=lambda: state["now"])
+
+    assert [e["seconds"] for e in report["episodes"]] == [pytest.approx(3.0)] * 2     # 30 ステップ × 0.1 秒
